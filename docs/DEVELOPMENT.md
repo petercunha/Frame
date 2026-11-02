@@ -53,6 +53,9 @@ server/openrouter.ts OpenRouter client and model metadata parsing
 server/wan.ts        Wan 3.0 native API client and documented capabilities
 server/connections.ts Private persisted provider keys and workspace mode
 server/store.ts     Serialized, atomic JSON persistence
+server/outputs.ts   Streaming output archive, recovery, and download retries
+server/job-references.ts Exact reference snapshots and available-input reuse
+client/completion-sound.ts Gesture-unlocked completion bell and mute preference
 server/media.ts     Media inspection, edit validation, and queued Sharp/FFmpeg preparation
 server/media.test.ts Real media processing and original-preservation tests
 server/reference-host.ts Temporary HTTPS links and isolated file-only tunnel
@@ -75,7 +78,7 @@ For OpenRouter:
 4. Submit one request to `POST /api/v1/videos`. Submission is never automatically retried, avoiding accidental duplicate charges.
 5. Save the job ID and settings locally; poll every five seconds with exponential backoff for transient failures.
 6. Stop on `completed`, `failed`, `cancelled`, or `expired`. Keep terminal errors, output count, and reported USD cost in history.
-7. Proxy the authenticated content endpoint for playback and downloads. Range headers and partial responses are forwarded, and API keys stay out of media URLs.
+7. Queue every completed output for a streaming download into `DATA_DIR/outputs/`. Playback and download routes serve local files with HEAD and range support; no provider or key is needed once saved.
 
 OpenRouter authentication is sent only to its API base URL. Wan authentication is sent only to `https://api.wanapi.app`: key validation uses `GET /v1/balance`, submission uses `POST /wan/v1/wan3.0-video/generation`, and polling uses that endpoint plus the task ID. Wan’s `processing` status maps to `in_progress`. Downloads re-query the task and stream its signed HTTPS video URL without an Authorization header; signed URLs are not persisted. Submissions are never automatically retried. Job tracking resumes when the workspace is reopened after a server restart and a saved or environment key is available. Every new job records `apiProvider`; legacy jobs default to OpenRouter. Switching the workspace provider does not reroute existing jobs. Wan mode exposes only `wan3.0-video`, with 2–30 second output, 480p/720p/1080p, documented aspect ratios, audio, and seed controls. Wan pricing is left unknown rather than guessed.
 
@@ -93,6 +96,7 @@ All paths below start with `/api`. Browser session cookies are HttpOnly and Same
 | `/config` | GET | Public upload-size limit |
 | `/connection` | GET, POST, PATCH, DELETE | Inspect connection; POST `{ provider, key }` validates and saves a key; PATCH `{ provider }` switches mode; DELETE `?provider=wan` removes that provider’s saved key |
 | `/models` | GET | Active provider’s model catalog; optional `?provider=openrouter` or `?provider=wan` |
+| `/wan/balance` | GET | Read the workspace’s Wan account balance and key spending limit using its saved or environment Wan key |
 | `/assets` | GET, POST | List assets or upload multipart `files` |
 | `/assets/:id` | DELETE | Delete an owned asset |
 | `/assets/:id/content` | GET | Read an owned asset |
@@ -104,7 +108,9 @@ All paths below start with `/api`. Browser session cookies are HttpOnly and Same
 | `/prompts/:id` | GET, PUT, DELETE | Inspect history, save a new revision, or delete an owned prompt |
 | `/prompts/:id/restore` | POST | Restore an older revision as a new version |
 | `/jobs` | GET, POST | List or submit owned generations |
-| `/jobs/:id` | DELETE | Remove a terminal generation from local history |
+| `/jobs/:id` | DELETE | Remove a terminal generation and its archived video files |
+| `/jobs/:id/reuse` | GET | Return generation settings and exact reference versions still present on disk, plus an unavailable-reference count |
+| `/jobs/:id/archive` | POST | Retry saving the existing completed outputs without submitting a new generation |
 | `/jobs/:id/content` | GET | Stream an output; `index=N` selects a clip, `download=1` downloads it |
 
 Uploads are checked by file signatures, not just the provided filename. Limits are 12 originals per upload, a configurable 10 GB per original, 25 MB per model input, 50 MB of references per job, and three active generations per browser workspace. The Node server allows long upload requests; production reverse proxies also need suitable body-size and timeout settings. Frame slots are unique; mixing frame images with reference assets is rejected because OpenRouter gives frames precedence. There is no cancellation button because the documented API does not expose a cancellation endpoint.
@@ -134,7 +140,25 @@ Use `POST /assets/:id/prepare` with a JSON recipe such as:
 
 Omit crop and size controls for audio, and time controls for images. Limits and media duration are validated server-side. FFmpeg inputs allow local file/pipe protocols only; file paths and filter expressions are generated on the server, not accepted from clients. Outputs larger than 25 MB fail with a request to shorten the selection or reduce dimensions. A task has a ten-minute processing timeout; seeking before decoding makes short excerpts of long recordings efficient.
 
-Local data and keys are excluded from the initial Git repository. Back up `data/` if you want to retain uploads and job history. Generated media is streamed from the original provider rather than archived automatically on disk.
+Local data and keys are excluded from the initial Git repository. Back up `data/` if you want to retain uploads and job history. Generated media is streamed once from the original provider into local output files. Playback uses the local archive.
+
+## Wan account balance
+
+`GET /api/wan/balance` calls Wan’s read-only `GET /v1/balance` on the server. It uses only the current workspace’s saved Wan key (falling back to `WAN_API_KEY`), regardless of its OpenRouter key. Responses contain `currency`, `balance`, nullable `keyRemaining`, and `checkedAt`, with `Cache-Control: no-store`. Values must match the documented USD response; missing/malformed amounts return 502. No balance data or keys are persisted in browser storage, and balance fetches have a 15-second upstream timeout.
+
+Wan mode displays the balance in the composer and Connection settings. A finite key limit also shows the amount available with that key, bounded by the account balance. The shared client hook refreshes on connection/key changes, manual refresh, Wan submission and terminal job changes, window focus, and every minute while the page is visible. Switching providers or replacing/removing keys cancels stale requests and clears the previous balance. Errors show a retryable unavailable state rather than a fabricated zero. OpenRouter mode does not request or display Wan balances.
+
+## Generation history and local videos
+
+Jobs retain their model name, input controls, immutable reference snapshots, estimated cost (when calculable), actual `usage.cost` when reported, first observed processing time, terminal timestamp, and total elapsed milliseconds. Elapsed time includes queueing and uses Frame’s observation of the terminal status. Legacy terminal jobs derive elapsed time from their existing creation/update timestamps; missing prices remain unknown. Snapshots contain public asset metadata and the exact prepared version, without local filenames or credentials.
+
+`OutputArchive` saves at most two jobs concurrently. Every output is streamed to a mode-0600 `.part` file, checked for an empty or incomplete response, then atomically renamed. Completed output metadata is saved after each clip. Files that were renamed just before a crash can be recovered on startup. Partial transfers retry with backoff, preserve already saved clips, and never submit a generation. Storage errors remain separate from generation errors. Completed legacy jobs are backfilled automatically if the provider still has their outputs.
+
+Local playback checks workspace ownership and serves files directly with range and HEAD support. Vite denies direct access to output directories; Git ignores them even under a custom data directory. Deleting a job cancels its archive work and deletes its output files. Removing an API key does not affect saved playback. Keep `DATA_DIR` on persistent storage and include `outputs/` in backups.
+
+Reuse resolves owned originals/prepared versions on disk and returns only available inputs, preserving saved crops/trims and all generation settings. The client restores controls after model changes to prevent default settings from overwriting reused values. Missing references are counted and explained to the user.
+
+The completion bell is synthesized with Web Audio, unlocked by user interaction, and plays once on an observed active-to-completed transition. Initial history loads and local-save updates do not play it. A browser-local mute preference is exposed in the top bar. A closed browser cannot play a notification.
 
 ## HTTPS references for local installations
 
@@ -154,7 +178,7 @@ Updates require `expectedVersion`; stale updates return 409 without modifying hi
 
 ## Verification
 
-The integration suite covers persistent keys and provider choices across restarts, provider isolation and removal, Wan payload/status/download mapping, key-free CDN requests, uncertain submission handling, key validation, upload signature checks and session isolation, model discovery, asynchronous state transitions, provider failures, retry behavior, HTTPS reference payloads, token expiry/revocation and snapshot isolation, saved prompt revisions/restoration/concurrency, cost units, and ranged video downloads. Real media fixtures verify cropping location, resizing, trimming, audio removal, EXIF/video orientation, prepared version stability, restart recovery, failed preparations, large-original upload handling, and byte-for-byte original preservation. Browser checks cover desktop/mobile editors, prompt saving and rollback, and prepared image/video/audio playback. A separate live tunnel smoke check uses a synthetic clip to verify public HTTPS range downloads and isolation from the studio API; it never calls a paid model. A paid live generation requires your own key and is not part of automated tests.
+The integration suite covers offline/key-free archived playback, range and HEAD responses, streamed download retry/recovery, startup backfill, exact generation reuse, price/time persistence, persistent keys and provider choices across restarts, provider isolation and removal, Wan payload/status/download mapping, key-free CDN requests, uncertain submission handling, key validation, upload signature checks and session isolation, model discovery, asynchronous state transitions, provider failures, retry behavior, HTTPS reference payloads, token expiry/revocation and snapshot isolation, saved prompt revisions/restoration/concurrency, cost units, and ranged video downloads. Real media fixtures verify cropping location, resizing, trimming, audio removal, EXIF/video orientation, prepared version stability, restart recovery, failed preparations, large-original upload handling, and byte-for-byte original preservation. Browser checks cover desktop/mobile editors, prompt saving and rollback, and prepared image/video/audio playback. A separate live tunnel smoke check uses a synthetic clip to verify public HTTPS range downloads and isolation from the studio API; it never calls a paid model. A paid live generation requires your own key and is not part of automated tests.
 
 ## API references
 

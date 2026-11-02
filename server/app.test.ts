@@ -89,7 +89,7 @@ test('media uploads validate bytes, persist, and remain private to the browser s
   await agent.get(asset.url).expect(404);
 });
 
-test('text generation progresses asynchronously, persists cost, streams clips and forwards ranges', async () => {
+test('text generation progresses asynchronously, persists cost, and serves saved clips with local ranges', async () => {
   nextStatus = 'completed';
   const agent = request.agent(studio.app);
   await agent.post('/api/connection').send({ key: 'valid-test-key' });
@@ -105,7 +105,7 @@ test('text generation progresses asynchronously, persists cost, streams clips an
   assert.match(downloaded.headers['content-disposition'], /attachment/);
   assert.match(downloaded.headers['content-type'], /video\/mp4/);
   await agent.get(`/api/jobs/${id}/content`).set('Range', 'bytes=0-17').expect(206);
-  assert.equal(lastRange, 'bytes=0-17');
+  assert.equal(lastRange, null);
   await agent.get(`/api/jobs/${id}/content?index=2`).expect(400);
   await request(studio.app).get(`/api/jobs/${id}/content`).expect(404);
   const saved = JSON.parse(await readFile(join(directory, 'studio.json'), 'utf8'));

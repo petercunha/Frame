@@ -11,3 +11,5 @@ coverage/
 # Saved provider keys, including when DATA_DIR points outside data/.
 credentials.json
 credentials.json.tmp
+# Generated videos, including custom DATA_DIR locations.
+outputs/

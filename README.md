@@ -29,8 +29,11 @@ Describe a scene, choose how it should look, and let your selected video model b
 - **Keep the original. Edit the input.** Crop images or videos, choose maximum dimensions, and trim footage or sound. Your full-quality originals stay untouched.
 - **Frame the scene.** Use an image to guide the first or last frame on models that support it.
 - **Make it your own.** Choose duration, resolution, aspect ratio, and audio, with more controls when a model offers them.
+- **See your Wan balance.** In Wan API mode, the studio and Connection settings show your account balance and any API key spending limit. Refresh manually or let Frame update it automatically after generations and every minute while visible.
 - **Keep your creative flow.** Follow generation progress while working on your next idea. Run up to three generations at once.
-- **Watch, download, revisit.** Preview finished clips, download your favorites, and find past generations in My creations.
+- **Watch, download, revisit.** Finished videos save automatically on your computer. Find them in My creations, even when the provider is unavailable.
+- **Know what went into each scene.** See reported price, generation time, settings, and reference details. Reuse a generation’s prompt, available reference inputs, and settings.
+- **Hear when it’s ready.** A short ding announces completed generations. Use the speaker button in the top bar to mute it.
 
 No graphics card or local AI installation needed. Your selected API provider handles the generation.
 
@@ -120,7 +123,7 @@ Search available models and compare their supported settings. The studio updates
 | Guidance from several assets | Choose **References** and add your ingredients. |
 | A vertical video | Pick **9:16** under Aspect ratio, when available. |
 | A quick experiment | Start with a shorter clip and a lower resolution. |
-| To try a variation | Find the generation in **My creations** and choose **Reuse prompt**. |
+| To try a variation | Find the generation in **My creations** and choose **Reuse prompt** to restore its text, available references, model, and video settings. |
 | Five seconds from a long recording | Open the asset editor, scrub to the moment, and click **Use 5s here**. |
 | A smaller reference without losing the original | Set **Max width** and **Max height** in the editor, then **Save input**. |
 
@@ -168,14 +171,16 @@ The first reference that needs HTTPS hosting may take a little longer while HTTP
 
 Saved prompts and their version histories are stored locally with your workspace. They survive server restarts; reopen the studio in the same browser to find them.
 
-Generated videos are fetched from your selected provider. Download the clips you want to keep, since availability depends on the service’s retention period.
+Completed videos download automatically into `data/outputs/` (or your configured `DATA_DIR`). Once **Saved on this computer** appears, playback and downloads use that local copy and work without the provider or an API key. Partial saves retry automatically without creating another paid generation. Older completed jobs are also saved when their outputs are still available from the provider; expired outputs cannot be recovered. Removing a generation deletes its local video copies. Back up the data folder to keep your library safe.
+
+Each generation keeps its prompt, settings, model name, reported price, elapsed generation time, and snapshots of the reference input versions it used. **Details** shows this history. **Reuse prompt** restores available references with their original edits, plus duration, resolution, aspect ratio, audio, seed, and provider settings. Deleted or missing references are skipped with a notice. Prices the provider does not report appear as **Not reported**; estimates are kept separately. Generation time includes queueing and is measured when Frame observes completion.
 
 </details>
 
 <details>
 <summary><strong>Can I close the browser while a video is generating?</strong></summary>
 
-Yes, as long as the Node.js server stays running. It keeps checking active jobs in the background. If you restart the server, open the studio in the same browser to resume status checks with your saved key. Existing jobs keep their original provider when you switch modes. Closing the browser does not cancel a submitted generation.
+Yes, as long as the Node.js server stays running. It keeps checking active jobs in the background. If you restart the server, open the studio in the same browser to resume status checks with your saved key. Existing jobs keep their original provider when you switch modes. Closing the browser does not cancel a submitted generation or its automatic local download. A completion ding plays while the studio is open, after you interact with it; its speaker setting is saved in this browser.
 
 For references shared through HTTPS, keep Frame running until the job finishes: the provider may still need to fetch the temporary input link. Restarting Frame ends local tunnel links.
 
@@ -187,7 +192,7 @@ For references shared through HTTPS, keep Frame running until the job finishes: 
 - **The page won’t open:** make sure `npm run dev` is still running and use the local address printed in the terminal.
 - **Your key won’t connect:** check that it belongs to the selected provider, that it’s active, and that you copied the whole value.
 - **A generation fails:** read the error in the preview. Check your credits, try a different setting or model, or adjust the prompt.
-- **A video won’t play:** reconnect your key, then try downloading the video. Older outputs may no longer be available from the provider.
+- **A video won’t play:** check its local save status and try downloading it. Use **Retry save** if the local copy needs attention. Outputs that expired at the provider before they could be saved may no longer be recoverable.
 - **The model list won’t load:** check your internet connection and use **Retry model discovery**.
 
 </details>

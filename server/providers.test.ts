@@ -30,7 +30,7 @@ async function fixture() {
     if (parsed.pathname.endsWith('/videos/models')) return json({ data: [{ ...wanModel, id: 'alibaba/wan-3.0' }] });
     if (init?.method === 'POST') return parsed.hostname === 'wan.example' ? json({ task_info: { id: 'wan-task', status: 'pending' } }, 202) : json({ id: 'router-task', status: 'pending' }, 202);
     if (failPoll) { failPoll = false; return json({ error: { message: 'Rate limited' } }, 429); }
-    if (parsed.hostname === 'wan.example') return json({ task_info: { id: 'wan-task', status }, ...(status === 'completed' ? { videos: ['https://cdn.example/output.mp4?token=signed'] } : status === 'failed' ? { error: { message: 'Generation failed' } } : {}) });
+    if (parsed.hostname === 'wan.example') return json({ task_info: { id: 'wan-task', status }, ...(status === 'completed' ? { videos: ['https://cdn.example/output.mp4?token=signed'], usage: { cost: 0.21 } } : status === 'failed' ? { error: { message: 'Generation failed' } } : {}) });
     return json({ id: 'router-task', status: 'completed' });
   };
   let store = new Store(directory); await store.init();
@@ -106,10 +106,11 @@ test('Wan offers only Wan 3.0, maps its payload, and keeps polling/downloading o
       await new Promise(resolve => setTimeout(resolve, 15));
     }
     assert.equal(job.status, 'completed');
+    assert.equal(job.cost, 0.21);
     await request(f.app).get(`/api/jobs/${created.id}/content?download=1`).set('Cookie', cookie).set('Range', 'bytes=0-4').expect(206);
     const download = f.calls.find(call => call.url.hostname === 'cdn.example')!;
     assert.equal(new Headers(download.init?.headers).get('Authorization'), null);
-    assert.equal(new Headers(download.init?.headers).get('Range'), 'bytes=0-4');
+    assert.equal(new Headers(download.init?.headers).get('Range'), null);
     assert(!f.calls.some(call => call.url.hostname === 'router.example' && call.url.pathname.includes('/wan-task')));
     assert.equal(f.calls.filter(call => call.init?.method === 'POST').length, 1);
     const stored = await readFile(join(f.directory, 'studio.json'), 'utf8');

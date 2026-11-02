@@ -34,7 +34,7 @@ export class OpenRouter {
       response = await this.fetcher(`${this.base}${path}`, {
         ...init,
         headers: { ...(key ? { Authorization: `Bearer ${key}` } : {}), 'X-OpenRouter-Title': 'Frame Video Studio', ...init.headers },
-        signal: AbortSignal.timeout(90_000),
+        signal: AbortSignal.any([AbortSignal.timeout(90_000), ...(init.signal ? [init.signal] : [])]),
       });
     } catch { throw new ApiError(502, 'Could not reach OpenRouter. Check your connection and try again.'); }
     if (!response.ok) {
@@ -61,7 +61,7 @@ export class OpenRouter {
     return jobSchema.parse(await (await this.request(`/videos/${encodeURIComponent(id)}`, key)).json());
   }
   async validateKey(key: string) { await this.request('/key', key); }
-  content(key: string, id: string, index: number, range?: string) {
-    return this.request(`/videos/${encodeURIComponent(id)}/content?index=${index}`, key, { headers: range ? { Range: range } : {} });
+  content(key: string, id: string, index: number, range?: string, signal?: AbortSignal) {
+    return this.request(`/videos/${encodeURIComponent(id)}/content?index=${index}`, key, { headers: range ? { Range: range } : {}, signal });
   }
 }

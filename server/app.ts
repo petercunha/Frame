@@ -2,20 +2,20 @@ import express, { type ErrorRequestHandler } from 'express';
 import multer from 'multer';
 import { fileTypeFromFile } from 'file-type';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { unlink } from 'node:fs/promises';
+import { stat, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import { Store, publicAsset, publicJob, type StoredAsset, type StoredJob } from './store';
 import { OpenRouter, ApiError, type UpstreamJob } from './openrouter';
 import { Wan } from './wan';
 import { providerSchema } from './connections';
 import { generationSchema, validateGeneration, validateWanReferences, buildRequest, buildWanRequest, referenceFile } from './generation';
-import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, providerNames, terminalStatuses, type ApiProvider, type AssetKind, type Connection } from '../shared/types';
+import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, providerNames, terminalStatuses, type ApiProvider, type AssetKind, type Connection } from '../shared/types';
 import { editsSchema, MediaService } from './media';
 import { REFERENCE_PATH, ReferenceHost, type ReferencePublisher } from './reference-host';
 import { promptRoutes } from './prompts';
+import { OutputArchive } from './outputs';
+import { captureJobReferences, reusableJob } from './job-references';
 
 declare global { namespace Express { interface Request { studioOwner: string } } }
 
@@ -65,13 +65,19 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
   function applyJob(job: StoredJob, upstream: UpstreamJob) {
     job.status = upstream.status;
     job.updatedAt = new Date().toISOString();
+    if (job.status === 'in_progress') job.startedAt ??= job.updatedAt;
+    if (terminalStatuses.includes(job.status) && !job.finishedAt) {
+      job.finishedAt = job.updatedAt;
+      job.generationTimeMs = Math.max(0, Date.parse(job.finishedAt) - Date.parse(job.createdAt));
+    }
     if (upstream.error) {
       const message = typeof upstream.error === 'string' ? upstream.error : JSON.stringify(upstream.error);
       const key = keyFor(job.owner, jobProvider(job));
       job.error = key ? message.replaceAll(key, '[redacted]') : message;
     }
     if (upstream.usage?.cost !== undefined) job.cost = upstream.usage.cost;
-    job.outputCount = Math.max(upstream.unsigned_urls?.length ?? 0, upstream.urls?.length ?? 0, job.status === 'completed' ? 1 : 0);
+    job.outputCount = Math.max(job.outputCount, upstream.unsigned_urls?.length ?? 0, upstream.urls?.length ?? 0, job.status === 'completed' ? 1 : 0);
+    if (job.status === 'completed' && !job.storage) job.storage = { status: 'pending' };
     delete job.pollError;
   }
   function schedule(job: StoredJob, failures = 0) {
@@ -86,6 +92,7 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
         references.renew(jobReferences.get(job.id) ?? []);
         applyJob(job, await providers[jobProvider(job)].poll(key, job.upstreamId));
         await store.save();
+        if (job.status === 'completed') archive.schedule(job);
         if (terminalStatuses.includes(job.status)) { await references.release(jobReferences.get(job.id) ?? []); jobReferences.delete(job.id); }
       } catch (error) {
         nextFailures = failures + 1;
@@ -109,11 +116,26 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
     if (!job) throw new ApiError(404, 'Generation not found.');
     return job;
   };
+  const archive = new OutputArchive(store, (job, index, signal) => {
+    const provider = jobProvider(job);
+    return providers[provider].content(requireKey(job.owner, provider), job.upstreamId, index, undefined, signal);
+  });
+  for (const job of store.data.jobs) {
+    if (job.references) continue;
+    const assets = ownedAssets(job.owner);
+    const selections = job.input.assets.filter(selection => assets.some(asset => asset.id === selection.id && (!selection.preparedId || asset.versions?.some(version => version.id === selection.preparedId))));
+    job.references = captureJobReferences({ ...job.input, assets: selections }, assets);
+  }
+  // Backfill existing completed generations and resume interrupted local saves.
+  store.data.jobs.filter(job => job.status === 'completed').forEach(job => archive.schedule(job));
 
   app.get('/api/health', (_req, res) => { res.json({ ok: true }); });
   app.get('/api/config', (_req, res) => { res.json({ maxUploadBytes }); });
   app.get('/api/connection', (req, res) => {
     res.json(connectionFor(req.studioOwner));
+  });
+  app.get('/api/wan/balance', async (req, res) => {
+    res.json(await wan.balance(requireKey(req.studioOwner, 'wan')));
   });
   app.patch('/api/connection', async (req, res) => {
     const { provider } = z.object({ provider: providerSchema }).parse(req.body);
@@ -125,6 +147,7 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
     await providers[provider].validateKey(key);
     await connections.update(req.studioOwner, provider, key);
     store.data.jobs.filter(j => j.owner === req.studioOwner).forEach(j => schedule(j));
+    store.data.jobs.filter(job => job.owner === req.studioOwner && job.status === 'completed' && job.storage?.status !== 'saved').forEach(job => archive.schedule(job));
     res.json(connectionFor(req.studioOwner));
   });
   app.delete('/api/connection', async (req, res) => {
@@ -214,6 +237,7 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
   app.get('/api/jobs', (req, res) => {
     const jobs = store.data.jobs.filter(j => j.owner === req.studioOwner);
     jobs.forEach(j => schedule(j));
+    jobs.filter(job => job.status === 'completed' && job.storage?.status !== 'saved').forEach(job => archive.schedule(job));
     res.json({ jobs: jobs.map(publicJob).reverse() });
   });
   const submitting = new Set<string>();
@@ -254,40 +278,47 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
       const body = await build(input, assets, store.uploads, store.prepared, async source => {
         const reference = await references.publish(source); referenceIds.push(reference.id); return reference.url;
       });
+      const referenceDetails = captureJobReferences(input, assets);
+      const submittedAt = new Date().toISOString();
       const upstream = await providers[provider].submit(key, body);
-      const now = new Date().toISOString();
-      const job: StoredJob = { id: randomUUID(), apiProvider: provider, upstreamId: upstream.id, owner: req.studioOwner, title: input.prompt.slice(0, 80) || 'Image to video', status: upstream.status, input, createdAt: now, updatedAt: now, outputCount: 0 };
+      const job: StoredJob = { id: randomUUID(), apiProvider: provider, upstreamId: upstream.id, owner: req.studioOwner, title: input.prompt.slice(0, 80) || 'Image to video', status: upstream.status, input, modelName: model.name, references: referenceDetails, estimatedCost: estimateCost(model, input.duration, input.resolution ?? '', input.generate_audio ?? false) ?? undefined, createdAt: submittedAt, updatedAt: submittedAt, outputCount: 0 };
       applyJob(job, upstream);
       store.data.jobs.push(job);
       jobReferences.set(job.id, referenceIds);
       accepted = true;
       await store.save();
+      if (job.status === 'completed') archive.schedule(job);
       if (terminalStatuses.includes(job.status)) { await references.release(referenceIds); jobReferences.delete(job.id); }
       schedule(job);
       res.status(202).json({ job: publicJob(job) });
     } finally { if (!accepted) await references.release(referenceIds); submitting.delete(req.studioOwner); }
   });
+  app.get('/api/jobs/:id/reuse', async (req, res) => {
+    res.json(await reusableJob(store, findJob(String(req.params.id), req.studioOwner)));
+  });
+  app.post('/api/jobs/:id/archive', (req, res) => {
+    const job = findJob(String(req.params.id), req.studioOwner);
+    if (job.status !== 'completed') throw new ApiError(409, 'Wait for this generation to finish before saving its video.');
+    void archive.ensure(job).catch(() => {});
+    res.status(202).json({ job: publicJob(job) });
+  });
   app.get('/api/jobs/:id/content', async (req, res) => {
     const job = findJob(String(req.params.id), req.studioOwner);
     if (job.status !== 'completed') throw new ApiError(409, 'This video is not ready yet.');
     const index = z.coerce.number().int().min(0).max(job.outputCount - 1).parse(req.query.index ?? 0);
-    const provider = jobProvider(job);
-    const response = await providers[provider].content(requireKey(req.studioOwner, provider), job.upstreamId, index, req.get('range'));
-    res.status(response.status);
-    for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
-      const value = response.headers.get(header);
-      if (value) res.setHeader(header, value);
-    }
+    const path = archive.path(job, index);
+    const file = await stat(path).catch(() => null);
+    const output = job.outputs?.find(output => output.index === index);
+    if (!file?.isFile() || !file.size || (output && file.size !== output.size)) await archive.ensure(job);
     if (req.query.download === '1') res.attachment(`frame-${job.id.slice(0, 8)}-${index + 1}.mp4`);
-    if (!response.body) throw new ApiError(502, `${providerNames[provider]} returned an empty video.`);
-    try { await pipeline(Readable.fromWeb(response.body as never), res); }
-    catch (error) { if (!res.destroyed) throw error; }
+    res.type(job.outputs?.find(output => output.index === index)?.mime ?? 'video/mp4').sendFile(path, { dotfiles: 'allow' });
   });
   app.delete('/api/jobs/:id', async (req, res) => {
     const job = findJob(String(req.params.id), req.studioOwner);
     if (!terminalStatuses.includes(job.status)) throw new ApiError(409, 'Wait until this generation finishes before removing it.');
     store.data.jobs = store.data.jobs.filter(j => j !== job);
     await store.save();
+    await archive.remove(job);
     res.status(204).end();
   });
   app.use('/api', (_req, res) => { res.status(404).json({ error: 'API endpoint not found.' }); });
@@ -305,5 +336,5 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
     res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
   };
   app.use(errorHandler);
-  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); await references.close(); } };
+  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); await archive.close(); await references.close(); } };
 }

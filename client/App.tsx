@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
-import { ArrowDownToLine, ArrowRight, AudioLines, Bookmark, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, AudioLines, Bookmark, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, Volume2, VolumeX, WandSparkles, X } from 'lucide-react';
 import type { ApiProvider, Asset, AssetRole, Connection, GenerationInput, PreparedAsset, PromptAsset, SavedPrompt, VideoJob, VideoModel } from '../shared/types';
 import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, providerNames, terminalStatuses } from '../shared/types';
 import Modal from './components/Modal';
@@ -7,6 +7,10 @@ import { api, uploadAssets } from './api';
 import AssetEditor from './components/AssetEditor';
 import { formatBytes, inputSummary, isPreparing } from './media';
 import { SavePrompt, SavedPrompts } from './components/SavedPrompts';
+import GenerationDetails, { GenerationFacts, StorageStatus, generationTime } from './components/GenerationDetails';
+import { useCompletionSound } from './completion-sound';
+import WanBalance from './components/WanBalance';
+import { useWanBalance } from './wan-balance';
 
 type View = 'studio' | 'library' | 'assets' | 'inspiration';
 type Selection = GenerationInput['assets'][number] & { snapshot?: Asset; pendingPreparedId?: string };
@@ -27,6 +31,8 @@ export default function App() {
   const [modelsError, setModelsError] = useState('');
   const [assets, setAssets] = useState<Asset[]>([]);
   const [jobs, setJobs] = useState<VideoJob[]>([]);
+  const { soundEnabled, toggleSound, ding } = useCompletionSound(jobs);
+  const [detailJobId, setDetailJobId] = useState<string | null>(null);
   const [connection, setConnection] = useState<Connection>({ provider: 'openrouter', connected: false, source: null });
   const [modelsProvider, setModelsProvider] = useState<ApiProvider>('openrouter');
   const [connectionLoaded, setConnectionLoaded] = useState(false);
@@ -65,15 +71,19 @@ export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState('');
+  const wanBalance = useWanBalance(connection, jobs, connecting);
   const fileRef = useRef<HTMLInputElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const uploadRole = useRef<AssetRole>('reference');
   const modelRequest = useRef(0);
+  const pendingReuse = useRef<GenerationInput | null>(null);
   const model = modelsProvider === connection.provider ? models.find(m => m.id === modelId) : undefined;
   const providerName = providerNames[connection.provider];
   const providerDocs = connection.provider === 'wan' ? 'https://wanapi.app/docs/wan-3-0' : 'https://openrouter.ai/docs/guides/overview/multimodal/video-generation';
   const activeJob = jobs.find(j => j.id === activeJobId);
+  const detailJob = jobs.find(job => job.id === detailJobId);
   const activeCount = jobs.filter(j => !terminalStatuses.includes(j.status)).length;
+  const refreshCount = jobs.filter(job => !terminalStatuses.includes(job.status) || (job.status === 'completed' && job.storage?.status !== 'saved')).length;
   const completedCount = jobs.filter(j => j.status === 'completed').length;
   const selectedAssets = selections.map(selection => {
     const original = assets.find(asset => asset.id === selection.id);
@@ -130,7 +140,7 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem('frame.prompt', prompt); } catch { /* draft storage unavailable */ } }, [prompt]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(''), 5500); return () => clearTimeout(timer); } }, [toast]);
   useEffect(() => {
-    if (!activeCount) return;
+    if (!refreshCount) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
@@ -140,15 +150,25 @@ export default function App() {
     }
     timer = setTimeout(poll, 3000);
     return () => { stopped = true; clearTimeout(timer); };
-  }, [activeCount]);
+  }, [refreshCount]);
   useEffect(() => { setClipIndex(0); }, [activeJobId]);
   useEffect(() => {
     if (!model) return;
+    if (pendingReuse.current?.model === model.id && (pendingReuse.current.apiProvider ?? 'openrouter') === connection.provider) {
+      restoreControls(pendingReuse.current); pendingReuse.current = null; return;
+    }
     setDuration(current => model.supported_durations?.includes(current) ? current : model.supported_durations?.[0] ?? 5);
     setResolution(current => model.supported_resolutions?.includes(current) ? current : model.supported_resolutions?.[0] ?? '');
     setRatio(current => model.supported_aspect_ratios?.includes(current) ? current : model.supported_aspect_ratios?.[0] ?? '');
     setSize(''); setSeed(''); setProvider(''); setUpscale(''); setCreativity('');
   }, [modelId, model]);
+
+  function restoreControls(input: GenerationInput) {
+    setDuration(input.duration ?? 5); setResolution(input.resolution ?? ''); setRatio(input.aspect_ratio ?? ''); setSize(input.size ?? '');
+    setAudio(input.generate_audio ?? true); setSeed(input.seed === undefined ? '' : String(input.seed));
+    setUpscale(input.upscale_factor === undefined ? '' : String(input.upscale_factor)); setCreativity(input.creativity === undefined ? '' : String(input.creativity));
+    setProvider(input.provider ? JSON.stringify(input.provider, null, 2) : '');
+  }
 
   function navigate(next: View) { setView(next); setMobileNav(false); }
   function changeMode(next: typeof mode) {
@@ -211,6 +231,8 @@ export default function App() {
     setSubmitting(true);
     try {
       const result = await api<{ job: VideoJob }>('/jobs', { method: 'POST', body: JSON.stringify(input) });
+      if (result.job.apiProvider === 'wan') void wanBalance.refresh();
+      if (result.job.status === 'completed') ding();
       setJobs(current => [result.job, ...current]); setActiveJobId(result.job.id); setPreviewTab('preview'); setToast('Your generation is in the queue. You can keep creating.');
     } catch (error) { setFormError(errorText(error)); }
     finally { setSubmitting(false); }
@@ -239,11 +261,29 @@ export default function App() {
     finally { setConnecting(false); }
   }
   async function reuse(job: VideoJob) {
-    if ((job.apiProvider ?? 'openrouter') !== connection.provider && !await changeProvider(job.apiProvider ?? 'openrouter')) return;
-    setActiveSavedPrompt(null);
-    setModelId(job.input.model); setPrompt(job.input.prompt); setDuration(job.input.duration ?? 5); setResolution(job.input.resolution ?? ''); setRatio(job.input.aspect_ratio ?? '');
-    // Model controls reset on model change; missing/deleted references are not silently reused.
-    setSelections([]); setMode('text'); setView('studio'); setToast('Prompt and output settings copied. Reattach any references before generating.');
+    try {
+      const [result, library] = await Promise.all([
+        api<{ input: GenerationInput; references: PromptAsset[]; unavailableReferences: number }>(`/jobs/${job.id}/reuse`),
+        api<{ assets: Asset[] }>('/assets'),
+      ]);
+      const target = result.input.apiProvider ?? 'openrouter';
+      if (target !== connection.provider && !await changeProvider(target)) return;
+      setActiveSavedPrompt(null); setAssets(library.assets); setDetailJobId(null);
+      if (target === connection.provider && model?.id === result.input.model) restoreControls(result.input);
+      else pendingReuse.current = result.input;
+      setModelId(result.input.model); setPrompt(result.input.prompt);
+      setSelections(result.references.map(reference => ({ id: reference.id, role: reference.role, preparedId: reference.preparedId, snapshot: reference.snapshot })));
+      setMode(result.references.some(reference => reference.role !== 'reference') ? 'image' : result.references.length ? 'reference' : 'text');
+      setView('studio'); setFormError('');
+      setToast(result.unavailableReferences ? `Prompt and settings restored. ${result.unavailableReferences} reference${result.unavailableReferences === 1 ? ' is' : 's are'} no longer available and could not be attached.` : 'Prompt, reference inputs and video settings restored.');
+    } catch (error) { setToast(errorText(error)); }
+  }
+  async function retryArchive(job: VideoJob) {
+    try {
+      const result = await api<{ job: VideoJob }>(`/jobs/${job.id}/archive`, { method: 'POST' });
+      setJobs(current => current.map(existing => existing.id === job.id ? result.job : existing));
+      setToast('Retrying the download of your existing video.');
+    } catch (error) { setToast(errorText(error)); }
   }
   function useInspiration(index: number) { setActiveSavedPrompt(null); setPrompt(inspiration[index].prompt); navigate('studio'); setTimeout(() => promptRef.current?.focus(), 0); }
   function onDrop(event: DragEvent) { event.preventDefault(); setDragging(false); void uploadFiles(Array.from(event.dataTransfer.files)); }
@@ -271,8 +311,11 @@ export default function App() {
       </div>}
       <span className={`status-badge status-${job.status}`}>{labels[job.status]}</span>
     </button>
-    <div className="job-copy"><h3 title={job.title}>{job.title}</h3><p>{models.find(m => m.id === job.input.model)?.name.split(': ').at(-1) || job.input.model.split('/')[1]} <span>·</span> {job.input.duration ? `${job.input.duration}s` : 'Auto'} <span>·</span> {job.input.resolution || job.input.size || 'Auto'}</p>
-      <div className="job-actions"><button className="text-button" onClick={() => reuse(job)}><RefreshCw size={13} /> Reuse prompt</button>
+    <div className="job-copy"><h3 title={job.title}>{job.title}</h3><p>{job.modelName?.split(': ').at(-1) || models.find(m => m.id === job.input.model)?.name.split(': ').at(-1) || job.input.model.split('/').at(-1)} <span>·</span> {job.input.duration ? `${job.input.duration}s` : 'Auto'} <span>·</span> {job.input.resolution || job.input.size || 'Auto'}</p>
+      <div className="job-history-meta"><span>{job.input.aspect_ratio || 'Auto ratio'}</span><span>{job.cost !== undefined ? `${money(job.cost)} USD` : 'Price not reported'}</span><span>{job.generationTimeMs !== undefined ? `${generationTime(job.generationTimeMs)} to generate` : 'Time not recorded'}</span></div>
+      <time className="job-history-date" dateTime={job.createdAt}>{new Date(job.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</time>
+      <StorageStatus job={job} onRetry={() => void retryArchive(job)} />
+      <div className="job-actions"><button className="text-button" onClick={() => setDetailJobId(job.id)}>Details</button><button className="text-button" onClick={() => reuse(job)}><RefreshCw size={13} /> Reuse prompt</button>
         {terminalStatuses.includes(job.status) && <button className="icon-button small" aria-label={`Remove ${job.title}`} onClick={() => void removeJob(job.id)}><Trash2 size={14} /></button>}
       </div>
     </div>
@@ -301,7 +344,7 @@ export default function App() {
     </aside>
     <div className="main-shell">
       <header className="topbar"><div className="breadcrumb"><button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={21} /></button><span>Workspace</span><ChevronRight size={13} /><strong>{{ studio: 'Video studio', library: 'My creations', assets: 'Asset library', inspiration: 'Inspiration' }[view]}</strong></div>
-        <div className="topbar-actions"><a href={providerDocs} target="_blank" rel="noreferrer" className="docs-link">How it works <ExternalLink size={12} /></a><span className="topbar-divider" /><button className={`connection-button ${connection.connected ? 'connected' : ''}`} onClick={() => setModal('settings')}><span className={connection.connected ? 'green-dot' : 'amber-dot'} />{!connectionLoaded ? 'Connecting…' : connection.connected ? `${providerName} connected` : `Connect ${providerName}`}<ChevronDown size={13} /></button></div>
+        <div className="topbar-actions"><button className="completion-sound" aria-label={soundEnabled ? 'Mute completion sound' : 'Enable completion sound'} title={soundEnabled ? 'Completion sound on' : 'Completion sound off'} onClick={toggleSound}>{soundEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}</button><a href={providerDocs} target="_blank" rel="noreferrer" className="docs-link">How it works <ExternalLink size={12} /></a><span className="topbar-divider" /><button className={`connection-button ${connection.connected ? 'connected' : ''}`} onClick={() => setModal('settings')}><span className={connection.connected ? 'green-dot' : 'amber-dot'} />{!connectionLoaded ? 'Connecting…' : connection.connected ? `${providerName} connected` : `Connect ${providerName}`}<ChevronDown size={13} /></button></div>
       </header>
       <main>
         <div className="page-heading"><div><div className="eyebrow"><span /> YOUR CREATIVE WORKSPACE</div><h1>{{ studio: 'Big ideas. Moving pictures.', library: 'Your ideas, brought to life.', assets: 'Every great scene starts somewhere.', inspiration: 'A little spark goes a long way.' }[view]}</h1><p>{{ studio: 'Turn a thought, an image, or a little inspiration into your next video.', library: 'All your generations, in one place. Pick up where inspiration left off.', assets: 'Keep your images, footage, and sound close to the creative process.', inspiration: 'Find a starting point. Make it something only you could imagine.' }[view]}</p></div>{view !== 'studio' && <button className="primary-button" onClick={() => view === 'assets' ? chooseFile() : navigate('studio')}><Plus size={16} />{view === 'assets' ? 'Upload assets' : 'Create a video'}</button>}</div>
@@ -310,6 +353,7 @@ export default function App() {
           <div className="studio-grid">
             <section className="composer card" aria-label="Video generation settings">
               <div className="card-topline"><div className="section-title"><WandSparkles size={18} /><h2>Create a video</h2></div><span className="subtle-label">LET’S MAKE SOMETHING</span></div>
+              {connection.provider === 'wan' && <WanBalance state={wanBalance} connected={connection.connected} onConnect={() => setModal('settings')} />}
               <div className="mode-tabs" aria-label="Generation mode">{(['text', 'image', 'reference'] as const).map(item => <button key={item} className={mode === item ? 'selected' : ''} onClick={() => changeMode(item)}>{item === 'text' ? <Film size={14} /> : item === 'image' ? <ImagePlus size={14} /> : <Images size={14} />}{item === 'text' ? 'Text to video' : item === 'image' ? 'Image to video' : 'References'}</button>)}</div>
               <div className="field-label"><label htmlFor="prompt">Your prompt</label><div className="prompt-inline-actions"><button className="text-button" disabled={!prompt.trim() || selectedPreparing || selectedAssets.some(selection => selection.missing)} onClick={() => setPromptToSave({ text: prompt, saved: activeSavedPrompt, assets: capturePromptAssets(), fromComposer: true })}><Bookmark size={11} />{activeSavedPrompt ? 'Save revision' : 'Save prompt'}</button><button className="text-button" onClick={() => setModal('prompts')}>Saved prompts <ChevronRight size={11} /></button></div></div>
               <div className="prompt-box"><textarea ref={promptRef} id="prompt" placeholder={'Imagine a scene. A place, a feeling, a story…\n\nDescribe what you want to see, how it moves, and what makes it yours.'} maxLength={10000} value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); if (!submitting && !uploading) void generate(); } }} /><div className="prompt-footer"><span><Sparkles size={12} /> A little detail makes a big difference</span><span>{prompt.length.toLocaleString()} / 10,000</span></div></div>
@@ -353,10 +397,10 @@ export default function App() {
               <div className="preview-card card"><div className="preview-header"><div className="preview-tabs"><button className={previewTab === 'preview' ? 'selected' : ''} onClick={() => setPreviewTab('preview')}>Preview</button><button className={previewTab === 'history' ? 'selected' : ''} onClick={() => setPreviewTab('history')}>Recent <span>{jobs.length}</span></button></div><span className="preview-header-icon"><Monitor size={16} /></span></div>
                 {previewTab === 'history' ? <div className="recent-list">{jobs.length ? jobs.slice(0, 8).map(job => renderJob(job, true)) : <div className="empty-small"><Clock3 size={28} /><h3>A fresh start.</h3><p>Your recent generations will appear here.</p></div>}</div> : <>
                   <div className={`preview-stage ${activeJob ? 'has-job' : ''}`}>
-                    {!activeJob ? <><img className="preview-landscape" src="https://images.unsplash.com/photo-1473448912268-2022ce9509d8?auto=format&fit=crop&w=1100&q=90" alt="Sunlight falling through a misty forest, a source of cinematic inspiration" /><div className="stage-shade" /><span className="inspiration-chip"><span /> ROOM TO IMAGINE</span><div className="stage-empty"><span className="stage-icon"><Clapperboard size={25} strokeWidth={1.4} /></span><h2>Your vision,<br /><em>in motion.</em></h2><p>Every great video starts with an idea.<br />Let’s bring yours to life.</p></div><div className="stage-bottom"><span>THE POSSIBILITIES ARE OPEN.</span><span className="frame-corner">↗</span></div></> : activeJob.status === 'completed' ? <video key={`${activeJob.id}-${clipIndex}`} className="result-video" src={`/api/jobs/${activeJob.id}/content?index=${clipIndex}`} controls playsInline autoPlay onError={() => setToast('Video playback is unavailable. Reconnect your key or try downloading the clip.')} /> : <div className="generation-state">{!terminalStatuses.includes(activeJob.status) ? <><div className="generation-orbit"><Sparkles size={28} /><span /></div><span className="status-badge">{labels[activeJob.status]}</span><h2>A little magic takes a moment.</h2><p>Your scene is coming together.<br />You can keep creating while we work.</p>{activeJob.pollError && <p className="poll-error">{activeJob.pollError} Status checks will retry automatically.</p>}</> : <><Film size={36} /><h2>{labels[activeJob.status]}</h2><p>{activeJob.error || 'This generation could not be completed. Adjust your prompt or try another provider.'}</p><button className="secondary-button" onClick={() => reuse(activeJob)}><RefreshCw size={14} /> Reuse prompt</button></>}</div>}
+                    {!activeJob ? <><img className="preview-landscape" src="https://images.unsplash.com/photo-1473448912268-2022ce9509d8?auto=format&fit=crop&w=1100&q=90" alt="Sunlight falling through a misty forest, a source of cinematic inspiration" /><div className="stage-shade" /><span className="inspiration-chip"><span /> ROOM TO IMAGINE</span><div className="stage-empty"><span className="stage-icon"><Clapperboard size={25} strokeWidth={1.4} /></span><h2>Your vision,<br /><em>in motion.</em></h2><p>Every great video starts with an idea.<br />Let’s bring yours to life.</p></div><div className="stage-bottom"><span>THE POSSIBILITIES ARE OPEN.</span><span className="frame-corner">↗</span></div></> : activeJob.status === 'completed' ? <video key={`${activeJob.id}-${clipIndex}`} className="result-video" src={`/api/jobs/${activeJob.id}/content?index=${clipIndex}`} controls playsInline autoPlay onError={() => setToast('Video playback is unavailable. Check the local save status or try downloading the clip.')} /> : <div className="generation-state">{!terminalStatuses.includes(activeJob.status) ? <><div className="generation-orbit"><Sparkles size={28} /><span /></div><span className="status-badge">{labels[activeJob.status]}</span><h2>A little magic takes a moment.</h2><p>Your scene is coming together.<br />You can keep creating while we work.</p>{activeJob.pollError && <p className="poll-error">{activeJob.pollError} Status checks will retry automatically.</p>}</> : <><Film size={36} /><h2>{labels[activeJob.status]}</h2><p>{activeJob.error || 'This generation could not be completed. Adjust your prompt or try another provider.'}</p><button className="secondary-button" onClick={() => reuse(activeJob)}><RefreshCw size={14} /> Reuse prompt</button></>}</div>}
                   </div>
                   <div className="preview-caption"><div><span className={`preview-status-dot ${activeJob?.status === 'completed' ? 'green-dot' : ''}`} /><span>{activeJob ? labels[activeJob.status] === 'Ready' ? 'Your video is ready' : labels[activeJob.status] : 'Your canvas is waiting'}</span></div><span>{activeJob?.input.duration ? `${activeJob.input.duration}s · ` : ''}{activeJob?.input.resolution || activeJob?.input.size || resolution || 'Auto'} <span>·</span> {activeJob?.input.aspect_ratio || ratio || 'Auto'}</span></div>
-                  <div className="preview-info">{activeJob ? <><p className="preview-prompt">{activeJob.input.prompt || 'Image-guided generation'}</p><div className="result-actions"><button className="secondary-button" onClick={() => reuse(activeJob)}><RefreshCw size={13} /> Reuse prompt</button>{activeJob.status === 'completed' && <a className="primary-button" href={`/api/jobs/${activeJob.id}/content?index=${clipIndex}&download=1`} download><ArrowDownToLine size={14} /> Download</a>}</div>{activeJob.outputCount > 1 && <label className="clip-select">Output clip<select value={clipIndex} onChange={e => setClipIndex(Number(e.target.value))}>{Array.from({ length: activeJob.outputCount }, (_, index) => <option key={index} value={index}>Clip {index + 1}</option>)}</select></label>}{activeJob.cost !== undefined && <span className="actual-cost">Actual cost: {money(activeJob.cost)}</span>}</> : <div className="preview-hint"><span className="hint-star"><Sparkles size={15} /></span><div><h3>A few words. A whole new world.</h3><p>Describe your scene, set the details, and hit generate. Your video will appear right here.</p></div></div>}</div>
+                  <div className="preview-info">{activeJob ? <><p className="preview-prompt">{activeJob.input.prompt || 'Image-guided generation'}</p><div className="result-actions"><button className="secondary-button" onClick={() => reuse(activeJob)}><RefreshCw size={13} /> Reuse prompt</button>{activeJob.status === 'completed' && <a className="primary-button" href={`/api/jobs/${activeJob.id}/content?index=${clipIndex}&download=1`} download><ArrowDownToLine size={14} /> Download</a>}</div>{activeJob.outputCount > 1 && <label className="clip-select">Output clip<select value={clipIndex} onChange={e => setClipIndex(Number(e.target.value))}>{Array.from({ length: activeJob.outputCount }, (_, index) => <option key={index} value={index}>Clip {index + 1}</option>)}</select></label>}<GenerationFacts job={activeJob} /><StorageStatus job={activeJob} onRetry={() => void retryArchive(activeJob)} /></> : <div className="preview-hint"><span className="hint-star"><Sparkles size={15} /></span><div><h3>A few words. A whole new world.</h3><p>Describe your scene, set the details, and hit generate. Your video will appear right here.</p></div></div>}</div>
                 </>}
               </div>
               <div className="creative-note"><span className="creative-note-icon"><ShieldCheck size={18} /></span><p><strong>Your ideas stay yours.</strong><span>Assets stay in this workspace and are sent to {providerName} when you generate.</span></p></div>
@@ -376,6 +420,7 @@ export default function App() {
     </div>
     <input className="sr-only" tabIndex={-1} aria-label="Upload media files" ref={fileRef} type="file" multiple accept="image/*,video/*,audio/*" onChange={e => void uploadFiles(Array.from(e.target.files || []), uploadRole.current)} />
     {editingAsset && <AssetEditor key={editingAsset.id} asset={editingAsset} initialPrepared={editingInput} onUpdate={updateEditedAsset} onClose={() => { setEditingAssetId(null); setEditingInput(undefined); }} />}
+    {detailJob && <GenerationDetails job={detailJob} onClose={() => setDetailJobId(null)} onReuse={() => void reuse(detailJob)} onRetry={() => void retryArchive(detailJob)} />}
     {modal === 'prompts' && <SavedPrompts onClose={() => setModal(null)} onUse={saved => { loadSavedPrompt(saved); setModal(null); navigate('studio'); setToast(`Loaded “${saved.title}” · version ${saved.version}.`); }} onEdit={saved => { setModal(null); setPromptToSave({ text: saved.text, saved, assets: saved.assets, fromComposer: false }); }} onUpdate={saved => { if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); }} onRemove={id => { if (activeSavedPrompt?.id === id) setActiveSavedPrompt(null); }} />}
     {promptToSave && <SavePrompt text={promptToSave.text} saved={promptToSave.saved} assets={promptToSave.assets} onClose={() => setPromptToSave(null)} onSaved={saved => { if (promptToSave.fromComposer) { loadSavedPrompt(saved); } else if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); setPromptToSave(null); setToast(`Saved “${saved.title}” · version ${saved.version}.`); }} />}
     {toast && <div className="toast" role="status"><Check size={17} /><span>{toast}</span><button className="icon-button small" aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}
@@ -387,6 +432,7 @@ export default function App() {
         {(['openrouter', 'wan'] as const).map(value => <button key={value} type="button" aria-pressed={connection.provider === value} disabled={connecting || !connectionLoaded} onClick={() => void changeProvider(value)}>{providerNames[value]}{connection.provider === value && <Check size={14} />}</button>)}
       </div>
       <p className="modal-description">{connection.provider === 'wan' ? 'Generate with Wan 3.0 through wanapi.app. This mode offers only Wan 3.0. Generation costs are billed to your Wan API account.' : 'Connect OpenRouter to generate with Wan, Seedance, Veo, and other available video models. Generation costs are billed to your OpenRouter account.'}</p>
+      {connection.provider === 'wan' && connection.connected && <WanBalance state={wanBalance} connected />}
       {connection.connected && <div className="connected-state"><Check size={17} />{connection.source === 'environment' ? 'Using your server’s environment key.' : 'Your key is saved. You’re ready to create.'}</div>}
       <form onSubmit={e => { e.preventDefault(); void connect(); }}>
         <label className="input-label" htmlFor="api-key">{connection.provider === 'wan' ? 'Wan' : providerName} API key</label>

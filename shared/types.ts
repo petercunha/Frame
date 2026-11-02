@@ -104,13 +104,35 @@ export interface VideoJob {
   error?: string;
   pollError?: string;
   cost?: number;
+  estimatedCost?: number;
+  modelName?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  generationTimeMs?: number;
+  references?: PromptAsset[];
+  outputs?: LocalVideo[];
+  storage?: { status: 'pending' | 'saving' | 'saved' | 'failed'; error?: string };
   outputCount: number;
+}
+
+export interface LocalVideo {
+  index: number;
+  mime: string;
+  size: number;
+  savedAt: string;
 }
 
 export interface Connection {
   provider: ApiProvider;
   connected: boolean;
   source: 'environment' | 'saved' | null;
+}
+
+export interface WanAccountBalance {
+  currency: 'USD';
+  balance: number;
+  keyRemaining: number | null;
+  checkedAt: string;
 }
 
 export interface SavedPrompt {
