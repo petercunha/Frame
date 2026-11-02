@@ -69,7 +69,7 @@ export class ReferenceHost implements ReferencePublisher {
 
   async publish(source: ReferenceSource): Promise<PublishedReference> {
     if (this.closed) throw new ApiError(503, 'Reference hosting is shutting down. Please retry after restarting Frame.');
-    if (!['video', 'audio'].includes(source.kind)) throw new ApiError(400, 'Only video and audio inputs need HTTPS hosting.');
+    if (!['image', 'video', 'audio'].includes(source.kind)) throw new ApiError(400, 'Only media inputs can use HTTPS hosting.');
     const info = await stat(source.path);
     if (!info.isFile() || info.size > MAX_REFERENCE_BYTES) throw new ApiError(413, 'Prepare this input below 25 MB before generating.');
     this.cancelIdle();
@@ -80,7 +80,7 @@ export class ReferenceHost implements ReferencePublisher {
     }
     if (!this.options.publicOrigin && (!this.tunnel || this.tunnel.exitCode !== null || this.tunnel.killed || this.origin !== origin)) throw new ApiError(503, 'HTTPS reference sharing was interrupted. Please retry. No generation was submitted.');
     const id = randomBytes(32).toString('hex');
-    const extension = ({ 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm', 'video/ogg': 'ogv', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/mpeg': 'mp3', 'audio/flac': 'flac', 'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac', 'audio/webm': 'webm' } as Record<string, string>)[source.mime];
+    const extension = ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif', 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm', 'video/ogg': 'ogv', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/mpeg': 'mp3', 'audio/flac': 'flac', 'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac', 'audio/webm': 'webm' } as Record<string, string>)[source.mime];
     if (!extension) throw new ApiError(400, 'Prepare this reference as MP4 video or WAV audio before generating.');
     const filename = `input.${extension}`;
     const path = resolve(this.directory, `${id}.${extension}`);
@@ -118,7 +118,7 @@ export class ReferenceHost implements ReferencePublisher {
     return this.starting;
   }
   private async startTunnel() {
-    // cloudflared is imported lazily so text/image generations need no tunnel or binary.
+    // cloudflared is imported lazily; text-only generations need no tunnel or binary.
     const { bin, install } = await import('cloudflared');
     const binary = process.env.CLOUDFLARED_BIN || bin;
     try { await access(binary); }

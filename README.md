@@ -21,7 +21,7 @@ A calm, creative workspace for turning your words, images, and references into A
 
 ## A little imagination goes a long way
 
-Describe a scene, choose how it should look, and let your selected video model bring it to life. Frame starts with **Wan 3.0** and discovers other available video models directly from OpenRouter, so you can explore different creative engines in one place.
+Describe a scene, choose how it should look, and let your selected video model bring it to life. Choose **OpenRouter** to discover available video models, or switch to **Wan API** to use **Wan 3.0** directly through [wanapi.app](https://wanapi.app/).
 
 - **Start with words.** Write a prompt or borrow a starting point from the inspiration gallery.
 - **Keep your best prompts.** Name and save a prompt, refine it over time, and restore any earlier version from its history.
@@ -32,14 +32,14 @@ Describe a scene, choose how it should look, and let your selected video model b
 - **Keep your creative flow.** Follow generation progress while working on your next idea. Run up to three generations at once.
 - **Watch, download, revisit.** Preview finished clips, download your favorites, and find past generations in My creations.
 
-No graphics card or local AI installation needed. OpenRouter handles the generation.
+No graphics card or local AI installation needed. Your selected API provider handles the generation.
 
 ## Get started
 
 You’ll need:
 
 1. **[Node.js](https://nodejs.org/)** — version 22.12 or newer. The current LTS version is a good choice.
-2. **An [OpenRouter API key](https://openrouter.ai/settings/keys)** and credits for generating videos. Think of the key as the connection between your studio and the video models.
+2. **An [OpenRouter API key](https://openrouter.ai/settings/keys) or [Wan API key](https://wanapi.app/)** and credits for generating videos. Think of the key as the connection between your studio and the video models.
 3. **[FFmpeg](https://ffmpeg.org/download.html)** for editing video and audio. On a Mac with Homebrew, run `brew install ffmpeg`. On Windows or Linux, use the download page and make sure both `ffmpeg` and `ffprobe` are available in your terminal. Image editing works without it.
 
 ### 1. Open the project
@@ -59,7 +59,7 @@ Open **[http://127.0.0.1:3000](http://127.0.0.1:3000)** in your browser. Leave t
 
 ### 3. Connect and create
 
-Click **Connect OpenRouter** in the top-right corner, paste your API key, and connect. Then:
+Open **Connection settings** or click **Connect OpenRouter** in the top-right corner. Choose **OpenRouter** or **Wan API**, paste that provider’s API key, and connect. Your key and provider choice are saved for future visits and server restarts; reopen Frame in the same browser. Each provider keeps its own key. Wan API mode offers only Wan 3.0. Then:
 
 1. Describe the video you have in mind.
 2. Add reference assets if you like.
@@ -131,7 +131,7 @@ Search available models and compare their supported settings. The studio updates
 <details>
 <summary><strong>Is Frame free?</strong></summary>
 
-Frame is free, open-source software. Video generation uses your OpenRouter account and may cost money. The studio shows an estimate when the model’s pricing makes that possible, and the actual charge when OpenRouter reports it. Provider rates and reference inputs can affect the final price.
+Frame is free, open-source software. Video generation uses your selected provider’s account and may cost money. The studio shows an estimate when the model’s pricing makes that possible, and the actual charge when the provider reports it. Wan rates are not estimated; check [Wan’s current pricing](https://wanapi.app/docs/wan-3-0). Provider rates and reference inputs can affect the final price.
 
 </details>
 
@@ -142,42 +142,42 @@ Common image, video, and audio formats are supported, including JPG, PNG, WebP, 
 
 AI inputs have a separate limit: 25 MB per asset and 50 MB per generation in total. Use the editor to trim or resize large originals before generating. Animated image originals are preserved; a prepared image uses their first frame.
 
-Images can be used as references or, when supported, first and last frames. Video and audio guidance requires a compatible provider, such as BytePlus with Seedance 2 or newer. Other providers may ignore those references. Frame images and reference assets are separate generation modes, so use one mode at a time.
+Images can be used as references or, when supported, first and last frames. Video and audio guidance requires a compatible provider, such as BytePlus with Seedance 2 or newer. Other OpenRouter providers may ignore those references. Wan API supports image, video, and audio references; video inputs must be MP4/MOV, 1–15 seconds each, with at most 15 reference seconds and 30 seconds of reference plus output. Frame images and reference assets are separate generation modes, so use one mode at a time.
 
 </details>
 
 <details>
 <summary><strong>Why do the options change between models?</strong></summary>
 
-Each model has its own capabilities. Frame reads those from OpenRouter and shows the available choices. A disabled setting means that model does not expose that control. Providers can also have additional restrictions, which appear as an error if a request cannot be served.
+Each model has its own capabilities. Frame reads those from OpenRouter or uses the documented Wan 3.0 settings in Wan API mode, and shows the available choices. A disabled setting means that model does not expose that control. Providers can also have additional restrictions, which appear as an error if a request cannot be served.
 
 </details>
 
 <details>
 <summary><strong>Where do my key and files go?</strong></summary>
 
-A key entered in the app stays in the server’s memory and expires after 24 hours of inactivity. Restarting the server clears it. Frame never saves that key in browser storage or on disk.
+Keys entered in the app are saved locally in `data/credentials.json` (or your configured `DATA_DIR`), separately from uploads and history, with owner-only file permissions. They survive server restarts and are scoped to your browser workspace. Keys are never saved in browser storage or returned by the API. The credentials file, its temporary write file, and `.env` files are ignored by Git. Keep these local files private. Switch providers or choose **Remove saved key** in Connection settings whenever needed.
 
-Uploads and generation history live in the local `data` folder. Your browser session identifies your workspace, so reopen Frame in the same browser to see it again. Your prompt draft is saved in that browser. References are sent to OpenRouter and the selected provider when you generate; their data policies apply.
+Uploads and generation history live in the local `data` folder. Your browser session identifies your workspace, so reopen Frame in the same browser to see it again. Your prompt draft is saved in that browser. References are sent to your selected API provider when you generate; their data policies apply.
 
 Asset edits create a separate prepared file. The original is never overwritten, and only your prepared input is sent when one is saved. Unedited assets use the original if it fits within the input limits.
 
-Video and audio references need an HTTPS link that OpenRouter can fetch. On a local install, Frame starts a separate, file-only Cloudflare Quick Tunnel when needed. It shares only temporary copies of the selected model inputs through unguessable links, and revokes those links when the generation reaches a final status. Links expire after two hours unless an active job renews them. Your studio, API key, and other library files are not served through that tunnel. Cloudflare carries the reference transfer; OpenRouter and the provider receive the selected input.
+Video and audio references through OpenRouter, and all references through Wan API, need public HTTPS links that the provider can fetch. On a local install, Frame starts a separate, file-only Cloudflare Quick Tunnel when needed. It shares only temporary copies of the selected model inputs through unguessable links, and revokes those links when the generation reaches a final status. Links expire after two hours unless an active job renews them. Your studio, API key, and other library files are not served through that tunnel. Cloudflare carries the reference transfer; your selected provider receives the selected input.
 
-The first video/audio reference may take a little longer while HTTPS sharing starts. Frame checks multiple DNS services and verifies that its reference server can be reached over HTTPS before submitting a generation. DNS checks can take up to two minutes; if they time out, retrying reuses the same address while it warms up. The helper stays available for ten minutes after its last reference is released. The `cloudflared` helper is installed automatically by the dependency or on first use. Hosted installations can configure their own stable HTTPS origin instead.
+The first reference that needs HTTPS hosting may take a little longer while HTTPS sharing starts. Frame checks multiple DNS services and verifies that its reference server can be reached over HTTPS before submitting a generation. DNS checks can take up to two minutes; if they time out, retrying reuses the same address while it warms up. The helper stays available for ten minutes after its last reference is released. The `cloudflared` helper is installed automatically by the dependency or on first use. Hosted installations can configure their own stable HTTPS origin instead.
 
 Saved prompts and their version histories are stored locally with your workspace. They survive server restarts; reopen the studio in the same browser to find them.
 
-Generated videos are fetched from OpenRouter. Download the clips you want to keep, since availability depends on the service’s retention period.
+Generated videos are fetched from your selected provider. Download the clips you want to keep, since availability depends on the service’s retention period.
 
 </details>
 
 <details>
 <summary><strong>Can I close the browser while a video is generating?</strong></summary>
 
-Yes, as long as the Node.js server stays running. It keeps checking active jobs in the background. If you restart the server, reconnect your key and open the studio to resume status checks. Closing the browser does not cancel a submitted generation.
+Yes, as long as the Node.js server stays running. It keeps checking active jobs in the background. If you restart the server, open the studio in the same browser to resume status checks with your saved key. Existing jobs keep their original provider when you switch modes. Closing the browser does not cancel a submitted generation.
 
-For video/audio references, keep Frame running until the job finishes: the provider may still need to fetch the temporary input link. Restarting Frame ends local tunnel links.
+For references shared through HTTPS, keep Frame running until the job finishes: the provider may still need to fetch the temporary input link. Restarting Frame ends local tunnel links.
 
 </details>
 
@@ -185,9 +185,9 @@ For video/audio references, keep Frame running until the job finishes: the provi
 <summary><strong>Something isn’t working. What should I try?</strong></summary>
 
 - **The page won’t open:** make sure `npm run dev` is still running and use the local address printed in the terminal.
-- **Your key won’t connect:** check that it’s an OpenRouter key, that it’s active, and that you copied the whole value.
+- **Your key won’t connect:** check that it belongs to the selected provider, that it’s active, and that you copied the whole value.
 - **A generation fails:** read the error in the preview. Check your credits, try a different setting or model, or adjust the prompt.
-- **A video won’t play:** reconnect your key, then try downloading the video. Older outputs may no longer be available from OpenRouter.
+- **A video won’t play:** reconnect your key, then try downloading the video. Older outputs may no longer be available from the provider.
 - **The model list won’t load:** check your internet connection and use **Retry model discovery**.
 
 </details>
@@ -202,7 +202,7 @@ Found a bug or have an idea? Open an issue. Contributions are welcome.
 
 Released under the **[MIT license](LICENSE)**. You can use, modify, and share Frame, including for commercial projects, under that license. Model access, generated content, and third-party assets remain subject to their respective terms.
 
-Built with React, TypeScript, Node.js, and Express. Video generation by [OpenRouter](https://openrouter.ai/), icons by [Lucide](https://lucide.dev/), and inspiration photography from [Unsplash](https://unsplash.com/).
+Built with React, TypeScript, Node.js, and Express. Video generation by [OpenRouter](https://openrouter.ai/) or [Wan API](https://wanapi.app/), icons by [Lucide](https://lucide.dev/), and inspiration photography from [Unsplash](https://unsplash.com/).
 
 <div align="center">
 <sub>Made for the way you imagine.</sub>

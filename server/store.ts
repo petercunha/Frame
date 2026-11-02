@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import type { Asset, PreparedAsset, PromptVersion, SavedPrompt, VideoJob } from '../shared/types';
+import { Connections } from './connections';
 
 export type StoredAsset = Asset & { owner: string; filename: string; versions?: (PreparedAsset & { filename: string })[] };
 export type StoredJob = VideoJob & { owner: string };
@@ -12,10 +13,12 @@ export class Store {
   private writes: Promise<void> = Promise.resolve();
   readonly uploads: string;
   readonly prepared: string;
-  constructor(readonly directory: string) { this.uploads = resolve(directory, 'uploads'); this.prepared = resolve(directory, 'prepared'); }
+  readonly connections: Connections;
+  constructor(readonly directory: string) { this.uploads = resolve(directory, 'uploads'); this.prepared = resolve(directory, 'prepared'); this.connections = new Connections(directory); }
   async init() {
     await mkdir(this.uploads, { recursive: true });
     await mkdir(this.prepared, { recursive: true });
+    await this.connections.init();
     try { this.data = { prompts: [], ...JSON.parse(await readFile(resolve(this.directory, 'studio.json'), 'utf8')) }; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     for (const prompt of this.data.prompts) {

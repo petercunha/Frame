@@ -8,7 +8,7 @@ const store = new Store(resolve(process.env.DATA_DIR || 'data'));
 await store.init();
 const maxUploadMB = Number(process.env.MAX_UPLOAD_MB || 10240);
 if (!Number.isFinite(maxUploadMB) || maxUploadMB < 1) throw new Error('MAX_UPLOAD_MB must be a positive number.');
-const { app, close } = createApp({ store, apiKey: process.env.OPENROUTER_API_KEY, maxUploadBytes: Math.floor(maxUploadMB * 1024 * 1024) });
+const { app, close } = createApp({ store, apiKey: process.env.OPENROUTER_API_KEY, wanApiKey: process.env.WAN_API_KEY, maxUploadBytes: Math.floor(maxUploadMB * 1024 * 1024) });
 if (process.env.NODE_ENV === 'production') {
   const directory = resolve('dist/client');
   app.use(express.static(directory));

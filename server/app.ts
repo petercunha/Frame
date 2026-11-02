@@ -9,31 +9,35 @@ import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import { Store, publicAsset, publicJob, type StoredAsset, type StoredJob } from './store';
 import { OpenRouter, ApiError, type UpstreamJob } from './openrouter';
-import { generationSchema, validateGeneration, buildRequest, referenceFile } from './generation';
-import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, terminalStatuses, type AssetKind } from '../shared/types';
+import { Wan } from './wan';
+import { providerSchema } from './connections';
+import { generationSchema, validateGeneration, validateWanReferences, buildRequest, buildWanRequest, referenceFile } from './generation';
+import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, providerNames, terminalStatuses, type ApiProvider, type AssetKind, type Connection } from '../shared/types';
 import { editsSchema, MediaService } from './media';
 import { REFERENCE_PATH, ReferenceHost, type ReferencePublisher } from './reference-host';
 import { promptRoutes } from './prompts';
 
 declare global { namespace Express { interface Request { studioOwner: string } } }
 
-interface AppOptions { store: Store; router?: OpenRouter; apiKey?: string; pollInterval?: number; maxUploadBytes?: number; references?: ReferencePublisher }
+interface AppOptions { store: Store; router?: OpenRouter; wan?: Wan; apiKey?: string; wanApiKey?: string; pollInterval?: number; maxUploadBytes?: number; references?: ReferencePublisher }
 
-export function createApp({ store, router = new OpenRouter(), apiKey, pollInterval = 5000, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, references = new ReferenceHost(resolve(store.directory, 'reference-exports'), { publicOrigin: process.env.REFERENCE_PUBLIC_ORIGIN }) }: AppOptions) {
+export function createApp({ store, router = new OpenRouter(), wan = new Wan(), apiKey, wanApiKey, pollInterval = 5000, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, references = new ReferenceHost(resolve(store.directory, 'reference-exports'), { publicOrigin: process.env.REFERENCE_PUBLIC_ORIGIN }) }: AppOptions) {
   const app = express();
-  const keys = new Map<string, { value: string; touched: number }>();
+  const providers = { openrouter: router, wan };
+  const environmentKeys = { openrouter: apiKey, wan: wanApiKey };
+  const connections = store.connections;
   const polls = new Map<string, ReturnType<typeof setTimeout>>();
   const media = new MediaService(store);
   const jobReferences = new Map<string, string[]>();
   app.use(REFERENCE_PATH, references.router);
   const polling = new Set<string>();
   let closed = false;
-  const keyFor = (owner: string) => {
-    const entry = keys.get(owner);
-    if (entry && Date.now() - entry.touched > 24 * 60 * 60 * 1000) keys.delete(owner);
-    else if (entry) { entry.touched = Date.now(); return entry.value; }
-    return apiKey || undefined;
+  const keyFor = (owner: string, provider: ApiProvider) => connections.key(owner, provider) || environmentKeys[provider] || undefined;
+  const connectionFor = (owner: string): Connection => {
+    const provider = connections.provider(owner);
+    return { provider, connected: !!keyFor(owner, provider), source: connections.key(owner, provider) ? 'saved' : environmentKeys[provider] ? 'environment' : null };
   };
+  const jobProvider = (job: StoredJob) => job.apiProvider ?? 'openrouter';
   app.disable('x-powered-by');
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -61,22 +65,26 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   function applyJob(job: StoredJob, upstream: UpstreamJob) {
     job.status = upstream.status;
     job.updatedAt = new Date().toISOString();
-    if (upstream.error) job.error = typeof upstream.error === 'string' ? upstream.error : JSON.stringify(upstream.error);
+    if (upstream.error) {
+      const message = typeof upstream.error === 'string' ? upstream.error : JSON.stringify(upstream.error);
+      const key = keyFor(job.owner, jobProvider(job));
+      job.error = key ? message.replaceAll(key, '[redacted]') : message;
+    }
     if (upstream.usage?.cost !== undefined) job.cost = upstream.usage.cost;
     job.outputCount = Math.max(upstream.unsigned_urls?.length ?? 0, upstream.urls?.length ?? 0, job.status === 'completed' ? 1 : 0);
     delete job.pollError;
   }
   function schedule(job: StoredJob, failures = 0) {
-    if (closed || terminalStatuses.includes(job.status) || polls.has(job.id) || polling.has(job.id) || !keyFor(job.owner)) return;
+    if (closed || terminalStatuses.includes(job.status) || polls.has(job.id) || polling.has(job.id) || !keyFor(job.owner, jobProvider(job))) return;
     const timer = setTimeout(async () => {
       polls.delete(job.id);
-      const key = keyFor(job.owner);
+      const key = keyFor(job.owner, jobProvider(job));
       if (!key || closed) return;
       polling.add(job.id);
       let nextFailures = 0;
       try {
         references.renew(jobReferences.get(job.id) ?? []);
-        applyJob(job, await router.poll(key, job.upstreamId));
+        applyJob(job, await providers[jobProvider(job)].poll(key, job.upstreamId));
         await store.save();
         if (terminalStatuses.includes(job.status)) { await references.release(jobReferences.get(job.id) ?? []); jobReferences.delete(job.id); }
       } catch (error) {
@@ -90,9 +98,9 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     timer.unref();
     polls.set(job.id, timer);
   }
-  function requireKey(owner: string) {
-    const key = keyFor(owner);
-    if (!key) throw new ApiError(401, 'Connect an OpenRouter API key to start generating.');
+  function requireKey(owner: string, provider: ApiProvider) {
+    const key = keyFor(owner, provider);
+    if (!key) throw new ApiError(401, `Connect your ${providerNames[provider]} key to continue.`);
     return key;
   }
   const ownedAssets = (owner: string) => store.data.assets.filter(a => a.owner === owner);
@@ -105,20 +113,29 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   app.get('/api/health', (_req, res) => { res.json({ ok: true }); });
   app.get('/api/config', (_req, res) => { res.json({ maxUploadBytes }); });
   app.get('/api/connection', (req, res) => {
-    res.json({ connected: !!keyFor(req.studioOwner), source: keys.has(req.studioOwner) ? 'session' : apiKey ? 'environment' : null });
+    res.json(connectionFor(req.studioOwner));
+  });
+  app.patch('/api/connection', async (req, res) => {
+    const { provider } = z.object({ provider: providerSchema }).parse(req.body);
+    await connections.update(req.studioOwner, provider);
+    res.json(connectionFor(req.studioOwner));
   });
   app.post('/api/connection', async (req, res) => {
-    const { key } = z.object({ key: z.string().trim().min(10).max(500) }).parse(req.body);
-    await router.validateKey(key);
-    keys.set(req.studioOwner, { value: key, touched: Date.now() });
+    const { key, provider = connections.provider(req.studioOwner) } = z.object({ key: z.string().trim().min(10).max(500), provider: providerSchema.optional() }).parse(req.body);
+    await providers[provider].validateKey(key);
+    await connections.update(req.studioOwner, provider, key);
     store.data.jobs.filter(j => j.owner === req.studioOwner).forEach(j => schedule(j));
-    res.json({ connected: true, source: 'session' });
+    res.json(connectionFor(req.studioOwner));
   });
-  app.delete('/api/connection', (req, res) => {
-    keys.delete(req.studioOwner);
-    res.json({ connected: !!apiKey, source: apiKey ? 'environment' : null });
+  app.delete('/api/connection', async (req, res) => {
+    const provider = providerSchema.parse(req.query.provider ?? connections.provider(req.studioOwner));
+    await connections.update(req.studioOwner, provider, null);
+    res.json(connectionFor(req.studioOwner));
   });
-  app.get('/api/models', async (_req, res) => { res.json({ models: await router.models() }); });
+  app.get('/api/models', async (req, res) => {
+    const provider = providerSchema.parse(req.query.provider ?? connections.provider(req.studioOwner));
+    res.json({ models: await providers[provider].models() });
+  });
   app.get('/api/assets', (req, res) => { res.json({ assets: ownedAssets(req.studioOwner).map(publicAsset).reverse() }); });
 
   const upload = multer({
@@ -201,7 +218,8 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   });
   const submitting = new Set<string>();
   app.post('/api/jobs', async (req, res) => {
-    const key = requireKey(req.studioOwner);
+    const provider = providerSchema.parse(req.body?.apiProvider ?? connections.provider(req.studioOwner));
+    const key = requireKey(req.studioOwner, provider);
     const input = generationSchema.parse(req.body);
     if (submitting.has(req.studioOwner)) throw new ApiError(429, 'A generation is already being submitted. Please wait.');
     if (store.data.jobs.filter(j => j.owner === req.studioOwner && !terminalStatuses.includes(j.status)).length >= 3) throw new ApiError(429, 'You can run up to three generations at once. Wait for one to finish.');
@@ -209,10 +227,10 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     const referenceIds: string[] = [];
     let accepted = false;
     try {
-      const model = (await router.models()).find(m => m.id === input.model);
+      const model = (await providers[provider].models()).find(m => m.id === input.model);
       if (!model) throw new ApiError(400, 'That model is no longer available. Choose another model.');
       const assets = ownedAssets(req.studioOwner);
-      validateGeneration(input, model, assets);
+      validateGeneration(input, model, assets, provider);
       input.assets = input.assets.map(selection => {
         const asset = assets.find(a => a.id === selection.id)!;
         if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) throw new ApiError(409, 'A selected asset is still being prepared. Wait for it to finish before generating.');
@@ -225,12 +243,20 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
         return bytes + file.size;
       }, 0);
       if (total > 50 * 1024 * 1024) throw new ApiError(413, 'Use at most 50 MB of references per generation.');
-      const body = await buildRequest(input, assets, store.uploads, store.prepared, async source => {
+      if (provider === 'wan') {
+        for (const selection of input.assets) {
+          const asset = assets.find(asset => asset.id === selection.id)!;
+          if (asset.kind === 'video' && !selection.preparedId) await media.inspect(asset);
+        }
+        validateWanReferences(input, assets);
+      }
+      const build = provider === 'wan' ? buildWanRequest : buildRequest;
+      const body = await build(input, assets, store.uploads, store.prepared, async source => {
         const reference = await references.publish(source); referenceIds.push(reference.id); return reference.url;
       });
-      const upstream = await router.submit(key, body);
+      const upstream = await providers[provider].submit(key, body);
       const now = new Date().toISOString();
-      const job: StoredJob = { id: randomUUID(), upstreamId: upstream.id, owner: req.studioOwner, title: input.prompt.slice(0, 80) || 'Image to video', status: upstream.status, input, createdAt: now, updatedAt: now, outputCount: 0 };
+      const job: StoredJob = { id: randomUUID(), apiProvider: provider, upstreamId: upstream.id, owner: req.studioOwner, title: input.prompt.slice(0, 80) || 'Image to video', status: upstream.status, input, createdAt: now, updatedAt: now, outputCount: 0 };
       applyJob(job, upstream);
       store.data.jobs.push(job);
       jobReferences.set(job.id, referenceIds);
@@ -245,14 +271,15 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     const job = findJob(String(req.params.id), req.studioOwner);
     if (job.status !== 'completed') throw new ApiError(409, 'This video is not ready yet.');
     const index = z.coerce.number().int().min(0).max(job.outputCount - 1).parse(req.query.index ?? 0);
-    const response = await router.content(requireKey(req.studioOwner), job.upstreamId, index, req.get('range'));
+    const provider = jobProvider(job);
+    const response = await providers[provider].content(requireKey(req.studioOwner, provider), job.upstreamId, index, req.get('range'));
     res.status(response.status);
     for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
       const value = response.headers.get(header);
       if (value) res.setHeader(header, value);
     }
     if (req.query.download === '1') res.attachment(`frame-${job.id.slice(0, 8)}-${index + 1}.mp4`);
-    if (!response.body) throw new ApiError(502, 'OpenRouter returned an empty video.');
+    if (!response.body) throw new ApiError(502, `${providerNames[provider]} returned an empty video.`);
     try { await pipeline(Readable.fromWeb(response.body as never), res); }
     catch (error) { if (!res.destroyed) throw error; }
   });
@@ -278,5 +305,5 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
   };
   app.use(errorHandler);
-  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); keys.clear(); await references.close(); } };
+  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); await references.close(); } };
 }

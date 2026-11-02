@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
 import { ArrowDownToLine, ArrowRight, AudioLines, Bookmark, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
-import type { Asset, AssetRole, Connection, GenerationInput, PreparedAsset, PromptAsset, SavedPrompt, VideoJob, VideoModel } from '../shared/types';
-import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, terminalStatuses } from '../shared/types';
+import type { ApiProvider, Asset, AssetRole, Connection, GenerationInput, PreparedAsset, PromptAsset, SavedPrompt, VideoJob, VideoModel } from '../shared/types';
+import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, providerNames, terminalStatuses } from '../shared/types';
 import Modal from './components/Modal';
 import { api, uploadAssets } from './api';
 import AssetEditor from './components/AssetEditor';
@@ -27,7 +27,8 @@ export default function App() {
   const [modelsError, setModelsError] = useState('');
   const [assets, setAssets] = useState<Asset[]>([]);
   const [jobs, setJobs] = useState<VideoJob[]>([]);
-  const [connection, setConnection] = useState<Connection>({ connected: false, source: null });
+  const [connection, setConnection] = useState<Connection>({ provider: 'openrouter', connected: false, source: null });
+  const [modelsProvider, setModelsProvider] = useState<ApiProvider>('openrouter');
   const [connectionLoaded, setConnectionLoaded] = useState(false);
   const [modelId, setModelId] = useState('alibaba/wan-3.0');
   const [prompt, setPrompt] = useState(() => { try { return localStorage.getItem('frame.prompt') || ''; } catch { return ''; } });
@@ -67,7 +68,10 @@ export default function App() {
   const fileRef = useRef<HTMLInputElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const uploadRole = useRef<AssetRole>('reference');
-  const model = models.find(m => m.id === modelId);
+  const modelRequest = useRef(0);
+  const model = modelsProvider === connection.provider ? models.find(m => m.id === modelId) : undefined;
+  const providerName = providerNames[connection.provider];
+  const providerDocs = connection.provider === 'wan' ? 'https://wanapi.app/docs/wan-3-0' : 'https://openrouter.ai/docs/guides/overview/multimodal/video-generation';
   const activeJob = jobs.find(j => j.id === activeJobId);
   const activeCount = jobs.filter(j => !terminalStatuses.includes(j.status)).length;
   const completedCount = jobs.filter(j => j.status === 'completed').length;
@@ -82,21 +86,24 @@ export default function App() {
   const editingAsset = assets.find(asset => asset.id === editingAssetId);
   const cost = estimateCost(model, model?.supported_durations?.length ? duration : undefined, resolution, audio);
 
-  async function loadModels() {
-    setModelsError('');
+  async function loadModels(target = connection.provider) {
+    const request = ++modelRequest.current;
+    setModelsError(''); setModels([]);
     try {
-      const result = await api<{ models: VideoModel[] }>('/models');
+      const result = await api<{ models: VideoModel[] }>(`/models?provider=${target}`);
+      if (request !== modelRequest.current) return;
+      setModelsProvider(target);
       setModels(result.models.sort((a, b) => (a.id === 'alibaba/wan-3.0' ? -1 : b.id === 'alibaba/wan-3.0' ? 1 : a.name.localeCompare(b.name))));
       setModelId(current => result.models.some(m => m.id === current) ? current : result.models[0]?.id || '');
-    } catch (error) { setModelsError(errorText(error)); }
+    } catch (error) { if (request === modelRequest.current) setModelsError(errorText(error)); }
   }
   useEffect(() => {
-    void loadModels();
     void api<{ maxUploadBytes: number }>('/config').then(result => setMaxUploadBytes(result.maxUploadBytes)).catch(() => {});
     void api<Connection>('/connection').then(setConnection).catch(e => setToast(errorText(e))).finally(() => setConnectionLoaded(true));
     void api<{ assets: Asset[] }>('/assets').then(r => setAssets(r.assets)).catch(e => setToast(errorText(e)));
     void api<{ jobs: VideoJob[] }>('/jobs').then(r => { setJobs(r.jobs); setActiveJobId(r.jobs[0]?.id ?? null); }).catch(e => setToast(errorText(e)));
   }, []);
+  useEffect(() => { if (connectionLoaded) void loadModels(connection.provider); }, [connectionLoaded, connection.provider]);
   useEffect(() => {
     if (!preparingCount) return;
     const timer = setInterval(() => {
@@ -183,7 +190,7 @@ export default function App() {
     if (!connection.connected) { setModal('settings'); return; }
     if (!model) return;
     setFormError('');
-    if (!prompt.trim() && !selections.some(s => s.role !== 'reference')) { setFormError('Describe your video, or add a first or last frame image.'); promptRef.current?.focus(); return; }
+    if (!prompt.trim() && !(connection.provider === 'wan' ? selections.length : selections.some(s => s.role !== 'reference'))) { setFormError('Describe your video, or add a first or last frame image.'); promptRef.current?.focus(); return; }
     let providerOptions: GenerationInput['provider'];
     if (provider.trim()) {
       try { providerOptions = JSON.parse(provider); if (!providerOptions?.options || Array.isArray(providerOptions.options)) throw new Error(); }
@@ -191,6 +198,7 @@ export default function App() {
     }
     if (seed && (!Number.isInteger(Number(seed)) || Number(seed) < 0 || Number(seed) > 2147483647)) { setFormError('Seed must be an integer from 0 to 2147483647.'); return; }
     const input: GenerationInput = {
+      apiProvider: connection.provider,
       model: modelId, prompt, assets: selections.map(selection => ({ id: selection.id, role: selection.role, preparedId: selection.preparedId === undefined ? assets.find(asset => asset.id === selection.id)?.prepared?.id ?? null : selection.preparedId })),
       ...(model.supported_durations?.length ? { duration } : {}),
       ...(size ? { size } : { ...(model.supported_resolutions?.length ? { resolution } : {}), ...(model.supported_aspect_ratios?.length ? { aspect_ratio: ratio } : {}) }),
@@ -209,11 +217,29 @@ export default function App() {
   }
   async function connect() {
     setConnecting(true); setConnectionError('');
-    try { setConnection(await api<Connection>('/connection', { method: 'POST', body: JSON.stringify({ key: apiKey }) })); setApiKey(''); setModal(null); setToast('OpenRouter connected. Your studio is ready.'); }
+    try { setConnection(await api<Connection>('/connection', { method: 'POST', body: JSON.stringify({ provider: connection.provider, key: apiKey }) })); setApiKey(''); setModal(null); setToast(`${providerName} connected. Your key is saved for next time.`); }
     catch (error) { setConnectionError(errorText(error)); }
     finally { setConnecting(false); }
   }
-  function reuse(job: VideoJob) {
+  async function changeProvider(provider: ApiProvider) {
+    setConnecting(true); setConnectionError(''); setApiKey('');
+    try {
+      setConnection(await api<Connection>('/connection', { method: 'PATCH', body: JSON.stringify({ provider }) }));
+      setFormError('');
+      return true;
+    } catch (error) { setConnectionError(errorText(error)); setToast(errorText(error)); return false; }
+    finally { setConnecting(false); }
+  }
+  async function removeKey() {
+    setConnecting(true); setConnectionError('');
+    try {
+      setConnection(await api<Connection>(`/connection?provider=${connection.provider}`, { method: 'DELETE' }));
+      setApiKey(''); setToast('Saved key removed.');
+    } catch (error) { setConnectionError(errorText(error)); }
+    finally { setConnecting(false); }
+  }
+  async function reuse(job: VideoJob) {
+    if ((job.apiProvider ?? 'openrouter') !== connection.provider && !await changeProvider(job.apiProvider ?? 'openrouter')) return;
     setActiveSavedPrompt(null);
     setModelId(job.input.model); setPrompt(job.input.prompt); setDuration(job.input.duration ?? 5); setResolution(job.input.resolution ?? ''); setRatio(job.input.aspect_ratio ?? '');
     // Model controls reset on model change; missing/deleted references are not silently reused.
@@ -268,14 +294,14 @@ export default function App() {
         <button className={view === 'inspiration' ? 'active' : ''} onClick={() => navigate('inspiration')}><Sparkles size={18} /> Inspiration <span className="new-badge">NEW</span></button>
       </nav>
       <div className="sidebar-bottom">
-        <div className="workspace-note"><div className="note-icon"><Film size={19} /></div><h3>A space for your ideas.</h3><p>{completedCount ? `${completedCount} video${completedCount === 1 ? '' : 's'} created. Keep the ideas rolling.` : 'From a spark of inspiration to your next great scene.'}</p><div className="note-rule" /><span><span className="green-dot" /> Powered by OpenRouter <ExternalLink size={11} /></span></div>
+        <div className="workspace-note"><div className="note-icon"><Film size={19} /></div><h3>A space for your ideas.</h3><p>{completedCount ? `${completedCount} video${completedCount === 1 ? '' : 's'} created. Keep the ideas rolling.` : 'From a spark of inspiration to your next great scene.'}</p><div className="note-rule" /><span><span className="green-dot" /> Powered by {providerName} <ExternalLink size={11} /></span></div>
         <button className="sidebar-settings" onClick={() => setModal('settings')}><Settings2 size={17} /> Connection settings <ChevronRight size={14} /></button>
         <div className="profile"><span className="profile-avatar">Y</span><div><strong>Your studio</strong><span>Made for creating</span></div><span className="version">v1.0</span></div>
       </div>
     </aside>
     <div className="main-shell">
       <header className="topbar"><div className="breadcrumb"><button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={21} /></button><span>Workspace</span><ChevronRight size={13} /><strong>{{ studio: 'Video studio', library: 'My creations', assets: 'Asset library', inspiration: 'Inspiration' }[view]}</strong></div>
-        <div className="topbar-actions"><a href="https://openrouter.ai/docs/guides/overview/multimodal/video-generation" target="_blank" rel="noreferrer" className="docs-link">How it works <ExternalLink size={12} /></a><span className="topbar-divider" /><button className={`connection-button ${connection.connected ? 'connected' : ''}`} onClick={() => setModal('settings')}><span className={connection.connected ? 'green-dot' : 'amber-dot'} />{!connectionLoaded ? 'Connecting…' : connection.connected ? 'OpenRouter connected' : 'Connect OpenRouter'}<ChevronDown size={13} /></button></div>
+        <div className="topbar-actions"><a href={providerDocs} target="_blank" rel="noreferrer" className="docs-link">How it works <ExternalLink size={12} /></a><span className="topbar-divider" /><button className={`connection-button ${connection.connected ? 'connected' : ''}`} onClick={() => setModal('settings')}><span className={connection.connected ? 'green-dot' : 'amber-dot'} />{!connectionLoaded ? 'Connecting…' : connection.connected ? `${providerName} connected` : `Connect ${providerName}`}<ChevronDown size={13} /></button></div>
       </header>
       <main>
         <div className="page-heading"><div><div className="eyebrow"><span /> YOUR CREATIVE WORKSPACE</div><h1>{{ studio: 'Big ideas. Moving pictures.', library: 'Your ideas, brought to life.', assets: 'Every great scene starts somewhere.', inspiration: 'A little spark goes a long way.' }[view]}</h1><p>{{ studio: 'Turn a thought, an image, or a little inspiration into your next video.', library: 'All your generations, in one place. Pick up where inspiration left off.', assets: 'Keep your images, footage, and sound close to the creative process.', inspiration: 'Find a starting point. Make it something only you could imagine.' }[view]}</p></div>{view !== 'studio' && <button className="primary-button" onClick={() => view === 'assets' ? chooseFile() : navigate('studio')}><Plus size={16} />{view === 'assets' ? 'Upload assets' : 'Create a video'}</button>}</div>
@@ -298,10 +324,10 @@ export default function App() {
                 {selectedAssets.length > 0 && <div className="attached-assets">{selectedAssets.map(({ asset }) => asset && <div className="attached-asset" key={asset.id}><span className="asset-thumb">{assetThumb(asset)}</span><span title={`${asset.name} · ${asset.prepared ? 'Prepared: ' : 'Original: '}${inputSummary(asset)}`}>{asset.name}{asset.prepared ? ' · Edited' : ''}</span>{editAssetButton(asset, true)}<button className="icon-button small" aria-label={`Detach ${asset.name}`} onClick={() => setSelections(current => current.filter(s => s.id !== asset.id))}><X size={12} /></button></div>)}</div>}
               </>}
               {selectedAssets.some(selection => selection.missing) && <div className="info-note">A saved reference is unavailable. Remove or replace it before generating.</div>}
-              {selectedAssets.some(s => s.asset?.kind !== 'image') && <div className="info-note">Video and audio guidance requires a supporting provider, such as BytePlus with Seedance 2+. Other providers may ignore these assets.</div>}
+              {selectedAssets.some(s => s.asset?.kind !== 'image') && <div className="info-note">{connection.provider === 'wan' ? 'Wan accepts up to 5 video and 5 audio references. Video inputs must be MP4 or MOV, 1–15 seconds each, with at most 15 seconds total. Reference video plus output must fit within 30 seconds.' : 'Video and audio guidance requires a supporting provider, such as BytePlus with Seedance 2+. Other providers may ignore these assets.'}</div>}
               <div className="composer-divider" />
-              <div className="field-label"><label>Generation model</label><span className="live-label"><span className="green-dot" /> OpenRouter</span></div>
-              <button className="model-select" onClick={() => { setModelSearch(''); setModal('models'); }}><span className="model-logo">{modelId.startsWith('alibaba/') ? 'wan' : <Layers3 size={20} />}</span><span className="model-detail"><strong>{modelName(model)}{modelId === 'alibaba/wan-3.0' && <span className="recommended-badge">RECOMMENDED</span>}</strong><small>{model?.id.split('/')[0] || 'Loading models…'} <span>·</span> {model?.supported_resolutions?.at(-1) || 'Flexible output'}{model?.generate_audio && ' · Audio support'}</small></span><ChevronDown size={16} /></button>
+              <div className="field-label"><label>Generation model</label><span className="live-label"><span className="green-dot" /> {providerName}</span></div>
+              <button className="model-select" onClick={() => { setModelSearch(''); setModal('models'); }}><span className="model-logo">{(modelId.startsWith('alibaba/') || connection.provider === 'wan') ? 'wan' : <Layers3 size={20} />}</span><span className="model-detail"><strong>{modelName(model)}{modelId === 'alibaba/wan-3.0' && <span className="recommended-badge">RECOMMENDED</span>}</strong><small>{connection.provider === 'wan' ? 'Wan API' : model?.id.split('/')[0] || 'Loading models…'} <span>·</span> {model?.supported_resolutions?.at(-1) || 'Flexible output'}{model?.generate_audio && ' · Audio support'}</small></span><ChevronDown size={16} /></button>
               {modelsError && <div className="form-error" role="alert">{modelsError}<button className="text-button" onClick={() => void loadModels()}>Retry model discovery</button></div>}
               <div className="output-settings">
                 <div className="select-field"><label htmlFor="duration"><Clock3 size={12} /> Duration</label><div className="select-wrap"><select id="duration" disabled={!model?.supported_durations?.length} value={model?.supported_durations?.length ? duration : ''} onChange={e => setDuration(Number(e.target.value))}>{model?.supported_durations?.length ? model.supported_durations.map(n => <option key={n} value={n}>{n} seconds</option>) : <option value="">Automatic</option>}</select><ChevronDown size={13} /></div></div>
@@ -320,7 +346,7 @@ export default function App() {
                 {!!Object.keys(model?.pricing_skus || {}).length && <details className="pricing-details"><summary>Model pricing</summary>{Object.entries(model!.pricing_skus).map(([key, value]) => <div key={key}><span>{key.replaceAll('_', ' ')}</span><code>{value}</code></div>)}<p className="hint">SKU units vary. Your actual charge appears after generation.</p></details>}
               </div>}
               {formError && <div className="form-error" role="alert">{formError}</div>}
-              <div className="generate-section"><button className="generate-button" disabled={submitting || uploading || !model || activeCount >= 3 || selectedPreparing} onClick={() => void generate()}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}<span>{submitting ? selectedAssets.some(selection => selection.asset?.kind !== 'image') ? 'Preparing & submitting…' : 'Submitting your vision…' : activeCount >= 3 ? '3 generations running' : selectedPreparing ? 'Preparing reference assets…' : oversizedInput ? 'Prepare reference input' : 'Generate video'}</span><ArrowRight size={17} /></button><div className="generation-footnote"><span>{cost === null ? 'Priced by your selected provider' : <>Estimated <strong>{money(cost)}</strong> / generation</>}</span><span>⌘ / Ctrl + Enter</span></div></div>
+              <div className="generate-section"><button className="generate-button" disabled={submitting || uploading || !model || activeCount >= 3 || selectedPreparing} onClick={() => void generate()}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}<span>{submitting ? selectedAssets.some(selection => connection.provider === 'wan' || selection.asset?.kind !== 'image') ? 'Preparing & submitting…' : 'Submitting your vision…' : activeCount >= 3 ? '3 generations running' : selectedPreparing ? 'Preparing reference assets…' : oversizedInput ? 'Prepare reference input' : 'Generate video'}</span><ArrowRight size={17} /></button><div className="generation-footnote"><span>{cost === null ? 'Priced by your selected provider' : <>Estimated <strong>{money(cost)}</strong> / generation</>}</span><span>⌘ / Ctrl + Enter</span></div></div>
             </section>
 
             <section className="preview-column" aria-label="Video preview">
@@ -333,7 +359,7 @@ export default function App() {
                   <div className="preview-info">{activeJob ? <><p className="preview-prompt">{activeJob.input.prompt || 'Image-guided generation'}</p><div className="result-actions"><button className="secondary-button" onClick={() => reuse(activeJob)}><RefreshCw size={13} /> Reuse prompt</button>{activeJob.status === 'completed' && <a className="primary-button" href={`/api/jobs/${activeJob.id}/content?index=${clipIndex}&download=1`} download><ArrowDownToLine size={14} /> Download</a>}</div>{activeJob.outputCount > 1 && <label className="clip-select">Output clip<select value={clipIndex} onChange={e => setClipIndex(Number(e.target.value))}>{Array.from({ length: activeJob.outputCount }, (_, index) => <option key={index} value={index}>Clip {index + 1}</option>)}</select></label>}{activeJob.cost !== undefined && <span className="actual-cost">Actual cost: {money(activeJob.cost)}</span>}</> : <div className="preview-hint"><span className="hint-star"><Sparkles size={15} /></span><div><h3>A few words. A whole new world.</h3><p>Describe your scene, set the details, and hit generate. Your video will appear right here.</p></div></div>}</div>
                 </>}
               </div>
-              <div className="creative-note"><span className="creative-note-icon"><ShieldCheck size={18} /></span><p><strong>Your ideas stay yours.</strong><span>Assets stay in this workspace and are sent to OpenRouter when you generate.</span></p></div>
+              <div className="creative-note"><span className="creative-note-icon"><ShieldCheck size={18} /></span><p><strong>Your ideas stay yours.</strong><span>Assets stay in this workspace and are sent to {providerName} when you generate.</span></p></div>
               <div className="tip-card"><span className="tip-eyebrow"><span className="tip-line" /> A LITTLE CREATIVE DIRECTION</span><p>Think like a director.<br /><span>Set the scene. Add movement. Find the light.</span></p><div className="tip-tags"><span>“slow camera push-in”</span><span>“soft morning light”</span></div></div>
             </section>
           </div>
@@ -354,9 +380,25 @@ export default function App() {
     {promptToSave && <SavePrompt text={promptToSave.text} saved={promptToSave.saved} assets={promptToSave.assets} onClose={() => setPromptToSave(null)} onSaved={saved => { if (promptToSave.fromComposer) { loadSavedPrompt(saved); } else if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); setPromptToSave(null); setToast(`Saved “${saved.title}” · version ${saved.version}.`); }} />}
     {toast && <div className="toast" role="status"><Check size={17} /><span>{toast}</span><button className="icon-button small" aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}
 
-    {modal === 'settings' && <Modal title="Connect your studio" onClose={() => { setModal(null); setApiKey(''); setConnectionError(''); }}><div className="connection-illustration"><KeyRound size={28} /></div><p className="modal-intro">One key. A world of possibilities.</p><p className="modal-description">Connect OpenRouter to generate with Wan, Seedance, Veo, and other available video models. Generation costs are billed to your OpenRouter account.</p>{connection.connected && <div className="connected-state"><Check size={17} />{connection.source === 'environment' ? 'Using your server’s environment key.' : 'Your studio is connected.'}</div>}<form onSubmit={e => { e.preventDefault(); void connect(); }}><label className="input-label" htmlFor="api-key">OpenRouter API key</label><input autoComplete="off" id="api-key" type="password" placeholder="sk-or-v1-…" value={apiKey} onChange={e => setApiKey(e.target.value)} required minLength={10} /><p className="hint"><ShieldCheck size={12} /> Your key is held in server memory for up to 24 hours of inactivity. It is never saved in browser storage or on disk.</p>{connectionError && <div className="form-error" role="alert">{connectionError}</div>}<button type="submit" className="primary-button full-width" disabled={connecting || apiKey.length < 10}>{connecting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={15} />}{connecting ? 'Checking your key…' : connection.connected ? 'Update API key' : 'Connect OpenRouter'}<ArrowRight size={15} /></button></form><div className="modal-bottom"><a href="https://openrouter.ai/settings/keys" target="_blank" rel="noreferrer">Get an API key <ExternalLink size={12} /></a>{connection.source === 'session' && <button className="text-button danger" onClick={async () => { try { setConnection(await api<Connection>('/connection', { method: 'DELETE' })); setToast('Session key removed.'); } catch (e) { setConnectionError(errorText(e)); } }}>Remove session key</button>}</div></Modal>}
+    {modal === 'settings' && <Modal title="Connect your studio" onClose={() => { setModal(null); setApiKey(''); setConnectionError(''); }}>
+      <div className="connection-illustration"><KeyRound size={28} /></div>
+      <p className="modal-intro">Choose your connection.</p>
+      <div className="provider-switch" role="group" aria-label="API provider">
+        {(['openrouter', 'wan'] as const).map(value => <button key={value} type="button" aria-pressed={connection.provider === value} disabled={connecting || !connectionLoaded} onClick={() => void changeProvider(value)}>{providerNames[value]}{connection.provider === value && <Check size={14} />}</button>)}
+      </div>
+      <p className="modal-description">{connection.provider === 'wan' ? 'Generate with Wan 3.0 through wanapi.app. This mode offers only Wan 3.0. Generation costs are billed to your Wan API account.' : 'Connect OpenRouter to generate with Wan, Seedance, Veo, and other available video models. Generation costs are billed to your OpenRouter account.'}</p>
+      {connection.connected && <div className="connected-state"><Check size={17} />{connection.source === 'environment' ? 'Using your server’s environment key.' : 'Your key is saved. You’re ready to create.'}</div>}
+      <form onSubmit={e => { e.preventDefault(); void connect(); }}>
+        <label className="input-label" htmlFor="api-key">{connection.provider === 'wan' ? 'Wan' : providerName} API key</label>
+        <input autoComplete="off" id="api-key" type="password" placeholder={connection.provider === 'wan' ? 'Paste your Wan API key' : 'sk-or-v1-…'} value={apiKey} onChange={e => setApiKey(e.target.value)} required minLength={10} disabled={connecting} />
+        <p className="hint"><ShieldCheck size={12} /> Saved privately on this computer for your workspace, including after restarts. Keys are never stored in browser storage or returned by the API. The credentials file is excluded from Git.</p>
+        {connectionError && <div className="form-error" role="alert">{connectionError}</div>}
+        <button type="submit" className="primary-button full-width" disabled={connecting || !connectionLoaded || apiKey.trim().length < 10}>{connecting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={15} />}{connecting ? 'Updating connection…' : connection.connected ? 'Replace API key' : `Connect ${providerName}`}<ArrowRight size={15} /></button>
+      </form>
+      <div className="modal-bottom"><a href={connection.provider === 'wan' ? 'https://wanapi.app/settings/apikeys' : 'https://openrouter.ai/settings/keys'} target="_blank" rel="noreferrer">Get an API key <ExternalLink size={12} /></a>{connection.source === 'saved' && <button className="text-button danger" disabled={connecting} onClick={() => void removeKey()}>Remove saved key</button>}</div>
+    </Modal>}
 
-    {modal === 'models' && <Modal title="Choose your creative engine" onClose={() => setModal(null)} wide><p className="modal-description">Live video models from OpenRouter. Available settings update automatically.</p><div className="search-box model-search"><Search size={17} /><input autoFocus placeholder="Search models or providers…" aria-label="Search video models" value={modelSearch} onChange={e => setModelSearch(e.target.value)} /></div><div className="model-list">{models.filter(m => `${m.name} ${m.id}`.toLowerCase().includes(modelSearch.toLowerCase())).map(m => <button className={`model-option ${modelId === m.id ? 'chosen' : ''}`} key={m.id} onClick={() => { setModelId(m.id); setModal(null); }}><span className="model-option-icon"><Layers3 size={20} /></span><span><strong>{m.name}{m.id === 'alibaba/wan-3.0' && <span className="recommended-badge">RECOMMENDED</span>}</strong><p>{m.description}</p><small>{m.supported_resolutions?.join(' · ') || 'Model-controlled output'}{m.generate_audio === true && ' · Audio'}{m.supported_durations?.length ? ` · ${Math.min(...m.supported_durations)}–${Math.max(...m.supported_durations)}s` : ''}</small></span>{modelId === m.id ? <Check size={18} /> : <ChevronRight size={16} />}</button>)}</div>{!models.length && <div className="empty-small"><p>{modelsError || 'Loading models…'}</p><button className="secondary-button" onClick={() => void loadModels()}>Refresh models</button></div>}</Modal>}
+    {modal === 'models' && <Modal title="Choose your creative engine" onClose={() => setModal(null)} wide><p className="modal-description">{connection.provider === 'wan' ? 'Wan API mode offers Wan 3.0. Switch to OpenRouter in Connection settings to explore other models.' : 'Live video models from OpenRouter. Available settings update automatically.'}</p><div className="search-box model-search"><Search size={17} /><input autoFocus placeholder="Search models or providers…" aria-label="Search video models" value={modelSearch} onChange={e => setModelSearch(e.target.value)} /></div><div className="model-list">{models.filter(m => `${m.name} ${m.id}`.toLowerCase().includes(modelSearch.toLowerCase())).map(m => <button className={`model-option ${modelId === m.id ? 'chosen' : ''}`} key={m.id} onClick={() => { setModelId(m.id); setModal(null); }}><span className="model-option-icon"><Layers3 size={20} /></span><span><strong>{m.name}{m.id === 'alibaba/wan-3.0' && <span className="recommended-badge">RECOMMENDED</span>}</strong><p>{m.description}</p><small>{m.supported_resolutions?.join(' · ') || 'Model-controlled output'}{m.generate_audio === true && ' · Audio'}{m.supported_durations?.length ? ` · ${Math.min(...m.supported_durations)}–${Math.max(...m.supported_durations)}s` : ''}</small></span>{modelId === m.id ? <Check size={18} /> : <ChevronRight size={16} />}</button>)}</div>{!models.length && <div className="empty-small"><p>{modelsError || 'Loading models…'}</p><button className="secondary-button" onClick={() => void loadModels()}>Refresh models</button></div>}</Modal>}
 
     {modal === 'assets' && <Modal title="Your creative ingredients" onClose={() => setModal(null)} wide><p className="modal-description">{mode === 'image' ? 'Choose an image for the first or last frame.' : 'Choose assets to guide this generation.'}</p><div className="asset-picker">{assets.filter(a => mode !== 'image' || a.kind === 'image').map(asset => <div className="asset-picker-row" key={asset.id}><span className="asset-picker-thumb">{assetThumb(asset)}</span><div><strong>{asset.name}</strong><small>{asset.kind} · {asset.prepared ? `Input: ${inputSummary(asset)}` : formatBytes(asset.size)}</small></div>{editAssetButton(asset)}{mode === 'image' ? <div className="frame-picker-actions">{model?.supported_frame_images?.map(role => <button key={role} className="secondary-button" onClick={() => { attach(asset, role as AssetRole); setModal(null); }}>{role === 'first_frame' ? 'First' : 'Last'}</button>)}</div> : <button className={`secondary-button ${selections.some(s => s.id === asset.id) ? 'is-selected' : ''}`} onClick={() => selections.some(s => s.id === asset.id) ? setSelections(current => current.filter(s => s.id !== asset.id)) : attach(asset)}>{selections.some(s => s.id === asset.id) ? <Check size={15} /> : <Plus size={15} />}{selections.some(s => s.id === asset.id) ? 'Added' : 'Add'}</button>}</div>)}</div>{!assets.length && <div className="empty-small"><FolderOpen size={28} /><p>Your asset library is empty. Upload your first creative ingredient.</p></div>}<button className="secondary-button full-width" disabled={uploading} onClick={() => { setModal(null); chooseFile(mode === 'image' ? 'first_frame' : 'reference'); }}><Upload size={15} /> Upload new assets</button></Modal>}
   </div>;

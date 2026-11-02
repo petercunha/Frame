@@ -40,7 +40,7 @@ export class OpenRouter {
     if (!response.ok) {
       let message = `OpenRouter returned ${response.status}.`;
       try { const body = await response.json(); message = body.error?.message || message; } catch { /* non-JSON upstream */ }
-      throw new ApiError(response.status, String(message));
+      throw new ApiError(response.status, key ? String(message).replaceAll(key, '[redacted]') : String(message));
     }
     return response;
   }

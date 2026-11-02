@@ -1,6 +1,8 @@
 export type AssetKind = 'image' | 'video' | 'audio';
 export type AssetRole = 'reference' | 'first_frame' | 'last_frame';
 export type JobStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled' | 'expired';
+export type ApiProvider = 'openrouter' | 'wan';
+export const providerNames: Record<ApiProvider, string> = { openrouter: 'OpenRouter', wan: 'Wan API' };
 export const terminalStatuses: JobStatus[] = ['completed', 'failed', 'cancelled', 'expired'];
 
 export interface VideoModel {
@@ -75,6 +77,7 @@ export function preparedDimensions(metadata: MediaMetadata, edits: AssetEdits, k
 }
 
 export interface GenerationInput {
+  apiProvider?: ApiProvider;
   model: string;
   prompt: string;
   duration?: number;
@@ -90,6 +93,7 @@ export interface GenerationInput {
 }
 
 export interface VideoJob {
+  apiProvider?: ApiProvider;
   id: string;
   upstreamId: string;
   title: string;
@@ -104,8 +108,9 @@ export interface VideoJob {
 }
 
 export interface Connection {
+  provider: ApiProvider;
   connected: boolean;
-  source: 'environment' | 'session' | null;
+  source: 'environment' | 'saved' | null;
 }
 
 export interface SavedPrompt {

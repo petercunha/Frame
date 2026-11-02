@@ -58,12 +58,12 @@ before(async () => {
 });
 after(async () => { await studio.close(); await rm(directory, { recursive: true, force: true }); });
 
-test('a key is required; valid session keys are checked and never returned', async () => {
+test('a key is required; valid saved keys are checked and never returned', async () => {
   const agent = request.agent(studio.app);
   await agent.post('/api/jobs').send(input).expect(401);
   await agent.post('/api/connection').send({ key: 'bad-test-key' }).expect(401);
   const connected = await agent.post('/api/connection').send({ key: 'valid-test-key' }).expect(200);
-  assert.deepEqual(connected.body, { connected: true, source: 'session' });
+  assert.deepEqual(connected.body, { provider: 'openrouter', connected: true, source: 'saved' });
   assert(!JSON.stringify(connected.body).includes('valid-test-key'));
   await agent.delete('/api/connection').expect(200);
   await agent.post('/api/jobs').send(input).expect(401);

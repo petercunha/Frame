@@ -8,3 +8,6 @@ data/
 .DS_Store
 coverage/
 .browser-artifacts/
+# Saved provider keys, including when DATA_DIR points outside data/.
+credentials.json
+credentials.json.tmp
