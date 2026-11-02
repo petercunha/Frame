@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { MAX_REFERENCE_BYTES, type AssetKind } from '../shared/types';
 import { ApiError } from './openrouter';
+import { waitForReferenceEndpoint } from './reference-readiness';
 
 export interface ReferenceSource { path: string; mime: string; kind: AssetKind }
 export interface PublishedReference { id: string; url: string }
@@ -29,22 +30,6 @@ export function httpsOrigin(value: string) {
   return url.origin;
 }
 
-async function waitForTunnelDns(origin: string) {
-  const hostname = new URL(origin).hostname;
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    try {
-      // Query public DNS before the OS first looks up this new hostname; an early
-      // NXDOMAIN can otherwise get cached locally even after DNS has propagated.
-      const result = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=A`, { headers: { Accept: 'application/dns-json' }, signal: AbortSignal.timeout(5000), cache: 'no-store' });
-      const body = await result.json() as { Status?: number; Answer?: { type: number }[] };
-      if (result.ok && body.Status === 0 && body.Answer?.some(answer => answer.type === 1)) return;
-    } catch { /* retry DNS propagation without logging the temporary origin */ }
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 1000));
-  }
-  throw new ApiError(503, 'The temporary HTTPS address is not ready yet. Please retry in a moment. No generation was submitted.');
-}
-
 export class ReferenceHost implements ReferencePublisher {
   readonly router = express.Router();
   private grants = new Map<string, { path: string; mime: string; filename: string; expires: number }>();
@@ -52,10 +37,18 @@ export class ReferenceHost implements ReferencePublisher {
   private tunnel?: ChildProcess;
   private origin?: string;
   private starting?: Promise<string>;
+  private warming?: Promise<void>;
+  private readyOrigin?: string;
+  private readinessToken = randomBytes(32).toString('hex');
+  private abort = new AbortController();
   private closed = false;
   private sweep: ReturnType<typeof setInterval>;
   private idle?: ReturnType<typeof setTimeout>;
   constructor(private directory: string, private options: { publicOrigin?: string; lifetime?: number; now?: () => number } = {}) {
+    this.router.get('/.ready/:token', (req, res) => {
+      if (req.params.token !== this.readinessToken) return res.status(404).end();
+      res.set({ 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer' }).type('text').send(`frame-reference-ready:${this.readinessToken}`);
+    });
     this.router.get('/:token/:filename', async (req, res, next) => {
       const grant = this.grants.get(String(req.params.token));
       if (!grant || grant.expires <= this.now() || req.params.filename !== grant.filename) return res.status(404).end();
@@ -79,7 +72,13 @@ export class ReferenceHost implements ReferencePublisher {
     if (!['video', 'audio'].includes(source.kind)) throw new ApiError(400, 'Only video and audio inputs need HTTPS hosting.');
     const info = await stat(source.path);
     if (!info.isFile() || info.size > MAX_REFERENCE_BYTES) throw new ApiError(413, 'Prepare this input below 25 MB before generating.');
+    this.cancelIdle();
     const origin = this.options.publicOrigin ? httpsOrigin(this.options.publicOrigin) : await this.ensureTunnel();
+    if (!this.options.publicOrigin && this.readyOrigin !== origin) {
+      this.warming ??= waitForReferenceEndpoint(origin, `${REFERENCE_PATH}/.ready/${this.readinessToken}`, `frame-reference-ready:${this.readinessToken}`, { signal: this.abort.signal }).then(() => { this.readyOrigin = origin; }).finally(() => { this.warming = undefined; });
+      await this.warming;
+    }
+    if (!this.options.publicOrigin && (!this.tunnel || this.tunnel.exitCode !== null || this.tunnel.killed || this.origin !== origin)) throw new ApiError(503, 'HTTPS reference sharing was interrupted. Please retry. No generation was submitted.');
     const id = randomBytes(32).toString('hex');
     const extension = ({ 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm', 'video/ogg': 'ogv', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/mpeg': 'mp3', 'audio/flac': 'flac', 'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac', 'audio/webm': 'webm' } as Record<string, string>)[source.mime];
     if (!extension) throw new ApiError(400, 'Prepare this reference as MP4 video or WAV audio before generating.');
@@ -90,7 +89,7 @@ export class ReferenceHost implements ReferencePublisher {
     await copyFile(source.path, path);
     if (this.closed) { await unlink(path).catch(() => {}); throw new ApiError(503, 'Reference hosting was stopped. Please retry.'); }
     this.grants.set(id, { path, mime: source.mime, filename, expires: this.now() + this.lifetime() });
-    if (this.idle) clearTimeout(this.idle);
+    this.cancelIdle();
     return { id, url: `${origin}${REFERENCE_PATH}/${id}/${filename}` };
   }
   renew(ids: string[]) { for (const id of ids) { const grant = this.grants.get(id); if (grant) grant.expires = this.now() + this.lifetime(); } }
@@ -98,8 +97,8 @@ export class ReferenceHost implements ReferencePublisher {
     const paths: string[] = [];
     for (const id of ids) { const grant = this.grants.get(id); if (grant) { paths.push(grant.path); this.grants.delete(id); } }
     await Promise.allSettled(paths.map(path => unlink(path)));
-    if (!this.grants.size && !this.closed && !this.idle) {
-      this.idle = setTimeout(() => { this.stopTunnel(); this.idle = undefined; }, 60_000);
+    if (!this.grants.size && !this.closed && !this.idle && !this.starting && !this.warming) {
+      this.idle = setTimeout(() => { this.stopTunnel(); this.idle = undefined; }, 10 * 60_000);
       this.idle.unref();
     }
   }
@@ -113,6 +112,7 @@ export class ReferenceHost implements ReferencePublisher {
     }));
   }
   private async ensureTunnel() {
+    this.cancelIdle();
     if (this.origin && this.tunnel && this.tunnel.exitCode === null && !this.tunnel.killed) return this.origin;
     if (!this.starting) this.starting = this.startTunnel().finally(() => { this.starting = undefined; });
     return this.starting;
@@ -160,18 +160,16 @@ export class ReferenceHost implements ReferencePublisher {
       };
       child.stdout.on('data', output); child.stderr.on('data', output);
       child.on('error', fail);
-      child.on('exit', () => { if (this.tunnel === child) { this.origin = undefined; this.tunnel = undefined; } fail(); });
+      child.on('exit', () => { if (this.tunnel === child) { this.origin = undefined; this.readyOrigin = undefined; this.tunnel = undefined; } fail(); });
     });
-    try {
-      await waitForTunnelDns(origin);
-      if (this.closed || child.exitCode !== null || child.killed) throw new ApiError(503, 'HTTPS reference sharing was interrupted. Please retry.');
-      this.origin = origin;
-      return origin;
-    } catch (error) { child.kill('SIGTERM'); throw error; }
+    if (this.closed || child.exitCode !== null || child.killed) throw new ApiError(503, 'HTTPS reference sharing was interrupted. Please retry.');
+    this.origin = origin;
+    return origin;
   }
-  private stopTunnel() { this.origin = undefined; this.tunnel?.kill('SIGTERM'); this.tunnel = undefined; }
+  private cancelIdle() { if (this.idle) clearTimeout(this.idle); this.idle = undefined; }
+  private stopTunnel() { this.origin = undefined; this.readyOrigin = undefined; this.tunnel?.kill('SIGTERM'); this.tunnel = undefined; }
   async close() {
-    this.closed = true; clearInterval(this.sweep); if (this.idle) clearTimeout(this.idle);
+    this.closed = true; this.abort.abort(); clearInterval(this.sweep); this.cancelIdle();
     this.stopTunnel(); this.server?.closeAllConnections(); this.server?.close();
     await this.release([...this.grants.keys()]);
   }
