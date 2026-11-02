@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
 import { ArrowDownToLine, ArrowRight, AudioLines, Bookmark, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
-import type { Asset, AssetRole, Connection, GenerationInput, SavedPrompt, VideoJob, VideoModel } from '../shared/types';
+import type { Asset, AssetRole, Connection, GenerationInput, PreparedAsset, PromptAsset, SavedPrompt, VideoJob, VideoModel } from '../shared/types';
 import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, terminalStatuses } from '../shared/types';
 import Modal from './components/Modal';
 import { api, uploadAssets } from './api';
@@ -9,7 +9,7 @@ import { formatBytes, inputSummary, isPreparing } from './media';
 import { SavePrompt, SavedPrompts } from './components/SavedPrompts';
 
 type View = 'studio' | 'library' | 'assets' | 'inspiration';
-type Selection = GenerationInput['assets'][number];
+type Selection = GenerationInput['assets'][number] & { snapshot?: Asset; pendingPreparedId?: string };
 const inspiration = [
   { title: 'Chase the golden hour', category: 'CINEMATIC', image: 'https://images.unsplash.com/photo-1500534623283-312aade485b7?auto=format&fit=crop&w=800&q=85', prompt: 'A cinematic aerial shot over rolling green hills at golden hour. Warm sunlight filters through a soft morning haze, casting long shadows across the landscape. Slow, smooth camera movement, natural film grain, rich earth tones.' },
   { title: 'Find a different perspective', category: 'NATURE', image: 'https://images.unsplash.com/photo-1518837695005-2083093ee35b?auto=format&fit=crop&w=800&q=85', prompt: 'An overhead drone shot of turquoise ocean waves meeting a pristine shore. White sea foam creates delicate patterns across the deep blue water. The camera slowly rises, revealing the vast, peaceful coastline. Photorealistic, soft afternoon light.' },
@@ -32,7 +32,7 @@ export default function App() {
   const [modelId, setModelId] = useState('alibaba/wan-3.0');
   const [prompt, setPrompt] = useState(() => { try { return localStorage.getItem('frame.prompt') || ''; } catch { return ''; } });
   const [activeSavedPrompt, setActiveSavedPrompt] = useState<SavedPrompt | null>(null);
-  const [promptToSave, setPromptToSave] = useState<{ text: string; saved?: SavedPrompt | null; fromComposer: boolean } | null>(null);
+  const [promptToSave, setPromptToSave] = useState<{ text: string; saved?: SavedPrompt | null; assets: PromptAsset[]; fromComposer: boolean } | null>(null);
   const [duration, setDuration] = useState(5);
   const [resolution, setResolution] = useState('720p');
   const [ratio, setRatio] = useState('16:9');
@@ -53,6 +53,7 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [maxUploadBytes, setMaxUploadBytes] = useState(DEFAULT_MAX_UPLOAD_BYTES);
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+  const [editingInput, setEditingInput] = useState<PreparedAsset | null | undefined>(undefined);
   const [dragging, setDragging] = useState(false);
   const [formError, setFormError] = useState('');
   const [toast, setToast] = useState('');
@@ -70,7 +71,11 @@ export default function App() {
   const activeJob = jobs.find(j => j.id === activeJobId);
   const activeCount = jobs.filter(j => !terminalStatuses.includes(j.status)).length;
   const completedCount = jobs.filter(j => j.status === 'completed').length;
-  const selectedAssets = selections.map(s => ({ ...s, asset: assets.find(a => a.id === s.id) })).filter(s => s.asset !== undefined);
+  const selectedAssets = selections.map(selection => {
+    const original = assets.find(asset => asset.id === selection.id);
+    const asset = original && selection.snapshot ? { ...original, prepared: selection.snapshot.prepared } : original ?? selection.snapshot;
+    return { ...selection, asset, missing: !original };
+  });
   const preparingCount = assets.filter(isPreparing).length;
   const selectedPreparing = selectedAssets.some(s => s.asset && isPreparing(s.asset));
   const oversizedInput = selectedAssets.find(s => s.asset && (s.asset.prepared?.size ?? s.asset.size) > MAX_REFERENCE_BYTES)?.asset;
@@ -99,6 +104,22 @@ export default function App() {
     }, 1500);
     return () => clearInterval(timer);
   }, [preparingCount]);
+  useEffect(() => {
+    setSelections(current => {
+      let changed = false;
+      const next = current.map(selection => {
+        if (!selection.pendingPreparedId) return selection;
+        const asset = assets.find(asset => asset.id === selection.id);
+        if (!asset || isPreparing(asset)) return selection;
+        changed = true;
+        const { pendingPreparedId, ...previous } = selection;
+        return asset.prepared?.id === pendingPreparedId
+          ? { ...previous, preparedId: asset.prepared.id, snapshot: structuredClone(asset) }
+          : previous;
+      });
+      return changed ? next : current;
+    });
+  }, [assets]);
   useEffect(() => { try { localStorage.setItem('frame.prompt', prompt); } catch { /* draft storage unavailable */ } }, [prompt]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(''), 5500); return () => clearTimeout(timer); } }, [toast]);
   useEffect(() => {
@@ -120,8 +141,6 @@ export default function App() {
     setResolution(current => model.supported_resolutions?.includes(current) ? current : model.supported_resolutions?.[0] ?? '');
     setRatio(current => model.supported_aspect_ratios?.includes(current) ? current : model.supported_aspect_ratios?.[0] ?? '');
     setSize(''); setSeed(''); setProvider(''); setUpscale(''); setCreativity('');
-    setSelections(current => current.filter(s => s.role === 'reference' || model.supported_frame_images?.includes(s.role)));
-    if (!model.supported_frame_images?.length) setMode(current => current === 'image' ? 'reference' : current);
   }, [modelId, model]);
 
   function navigate(next: View) { setView(next); setMobileNav(false); }
@@ -158,7 +177,9 @@ export default function App() {
     catch (error) { setToast(errorText(error)); }
   }
   async function generate() {
-    if (oversizedInput) { setEditingAssetId(oversizedInput.id); return; }
+    if (selectedAssets.some(selection => selection.missing)) { setFormError('A saved reference is missing from the library. Remove or replace it before generating.'); return; }
+    if (selections.some(selection => selection.role !== 'reference' && !model?.supported_frame_images?.includes(selection.role))) { setFormError('This model does not support the saved frame controls. Choose a model with the required first/last frame support.'); return; }
+    if (oversizedInput) { openAssetEditor(oversizedInput, true); return; }
     if (!connection.connected) { setModal('settings'); return; }
     if (!model) return;
     setFormError('');
@@ -170,7 +191,7 @@ export default function App() {
     }
     if (seed && (!Number.isInteger(Number(seed)) || Number(seed) < 0 || Number(seed) > 2147483647)) { setFormError('Seed must be an integer from 0 to 2147483647.'); return; }
     const input: GenerationInput = {
-      model: modelId, prompt, assets: selections.map(selection => ({ ...selection, preparedId: assets.find(asset => asset.id === selection.id)?.prepared?.id ?? null })),
+      model: modelId, prompt, assets: selections.map(selection => ({ id: selection.id, role: selection.role, preparedId: selection.preparedId === undefined ? assets.find(asset => asset.id === selection.id)?.prepared?.id ?? null : selection.preparedId })),
       ...(model.supported_durations?.length ? { duration } : {}),
       ...(size ? { size } : { ...(model.supported_resolutions?.length ? { resolution } : {}), ...(model.supported_aspect_ratios?.length ? { aspect_ratio: ratio } : {}) }),
       ...(model.generate_audio === true ? { generate_audio: audio } : {}),
@@ -202,7 +223,21 @@ export default function App() {
   function onDrop(event: DragEvent) { event.preventDefault(); setDragging(false); void uploadFiles(Array.from(event.dataTransfer.files)); }
 
   const assetThumb = (asset: Asset, large = false) => asset.kind === 'image' ? <img src={asset.prepared?.url ?? asset.url} alt={asset.name} loading="lazy" /> : asset.kind === 'video' ? <Film size={large ? 36 : 20} /> : <AudioLines size={large ? 36 : 20} />;
-  const editAssetButton = (asset: Asset) => <button className="icon-button edit-attached" aria-label={`Edit ${asset.name}`} title="Crop, trim & resize input" onClick={() => { setModal(null); setEditingAssetId(asset.id); }}><Pencil size={13} /></button>;
+  function openAssetEditor(asset: Asset, fromSelection = false) { setModal(null); setEditingInput(fromSelection ? asset.prepared ?? null : undefined); setEditingAssetId(asset.id); }
+  const editAssetButton = (asset: Asset, fromSelection = false) => <button className="icon-button edit-attached" aria-label={`Edit ${asset.name}`} title="Crop, trim & resize input" onClick={() => openAssetEditor(asset, fromSelection)}><Pencil size={13} /></button>;
+  function capturePromptAssets(): PromptAsset[] {
+    return selectedAssets.flatMap(selection => selection.asset ? [{ id: selection.id, role: selection.role, preparedId: selection.preparedId === undefined ? selection.asset.prepared?.id ?? null : selection.preparedId, snapshot: structuredClone(selection.asset) }] : []);
+  }
+  function loadSavedPrompt(saved: SavedPrompt) {
+    setPrompt(saved.text); setActiveSavedPrompt(saved); setSelections(saved.assets.map(reference => ({ id: reference.id, role: reference.role, preparedId: reference.preparedId, snapshot: reference.snapshot })));
+    setMode(saved.assets.some(reference => reference.role !== 'reference') ? 'image' : saved.assets.length ? 'reference' : 'text'); setFormError('');
+  }
+  function updateEditedAsset(updated: Asset, inputChanged = false) {
+    setAssets(current => current.map(asset => asset.id === updated.id ? updated : asset));
+    if (inputChanged && editingInput !== undefined) setSelections(current => current.map(selection => selection.id !== updated.id ? selection : isPreparing(updated)
+      ? { ...selection, pendingPreparedId: updated.preparation!.id }
+      : { ...selection, preparedId: updated.prepared?.id ?? null, snapshot: structuredClone(updated), pendingPreparedId: undefined }));
+  }
   const renderJob = (job: VideoJob, compact = false) => <article key={job.id} className={`job-card ${compact ? 'job-compact' : ''}`}>
     <button className="job-visual" onClick={() => { setActiveJobId(job.id); navigate('studio'); setPreviewTab('preview'); }} aria-label={`View ${job.title}`}>
       {job.status === 'completed' ? <><video src={`/api/jobs/${job.id}/content#t=0.1`} preload="metadata" muted playsInline /><span className="play-dot"><Film size={20} /></span></> : <div className={`job-placeholder ${job.status}`}>
@@ -250,18 +285,19 @@ export default function App() {
             <section className="composer card" aria-label="Video generation settings">
               <div className="card-topline"><div className="section-title"><WandSparkles size={18} /><h2>Create a video</h2></div><span className="subtle-label">LET’S MAKE SOMETHING</span></div>
               <div className="mode-tabs" aria-label="Generation mode">{(['text', 'image', 'reference'] as const).map(item => <button key={item} className={mode === item ? 'selected' : ''} onClick={() => changeMode(item)}>{item === 'text' ? <Film size={14} /> : item === 'image' ? <ImagePlus size={14} /> : <Images size={14} />}{item === 'text' ? 'Text to video' : item === 'image' ? 'Image to video' : 'References'}</button>)}</div>
-              <div className="field-label"><label htmlFor="prompt">Your prompt</label><div className="prompt-inline-actions"><button className="text-button" disabled={!prompt.trim()} onClick={() => setPromptToSave({ text: prompt, saved: activeSavedPrompt, fromComposer: true })}><Bookmark size={11} />{activeSavedPrompt ? 'Save revision' : 'Save prompt'}</button><button className="text-button" onClick={() => setModal('prompts')}>Saved prompts <ChevronRight size={11} /></button></div></div>
+              <div className="field-label"><label htmlFor="prompt">Your prompt</label><div className="prompt-inline-actions"><button className="text-button" disabled={!prompt.trim() || selectedPreparing || selectedAssets.some(selection => selection.missing)} onClick={() => setPromptToSave({ text: prompt, saved: activeSavedPrompt, assets: capturePromptAssets(), fromComposer: true })}><Bookmark size={11} />{activeSavedPrompt ? 'Save revision' : 'Save prompt'}</button><button className="text-button" onClick={() => setModal('prompts')}>Saved prompts <ChevronRight size={11} /></button></div></div>
               <div className="prompt-box"><textarea ref={promptRef} id="prompt" placeholder={'Imagine a scene. A place, a feeling, a story…\n\nDescribe what you want to see, how it moves, and what makes it yours.'} maxLength={10000} value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); if (!submitting && !uploading) void generate(); } }} /><div className="prompt-footer"><span><Sparkles size={12} /> A little detail makes a big difference</span><span>{prompt.length.toLocaleString()} / 10,000</span></div></div>
               <div className="field-label assets-label"><span>{mode === 'image' ? 'Frame images' : 'Reference assets'} <span className="optional">Optional</span></span><button className="text-button" onClick={() => setModal('assets')}>From library <ChevronRight size={12} /></button></div>
-              {mode === 'image' ? <div className="frame-slots">{(['first_frame', 'last_frame'] as const).filter(role => model?.supported_frame_images?.includes(role)).map(role => {
+              {mode === 'image' ? <div className="frame-slots">{(['first_frame', 'last_frame'] as const).filter(role => model?.supported_frame_images?.includes(role) || selectedAssets.some(selection => selection.role === role)).map(role => {
                 const asset = selectedAssets.find(a => a.role === role)?.asset;
-                return <div className="frame-slot" key={role}>{asset ? <><img src={asset.prepared?.url ?? asset.url} alt={role.replace('_', ' ')} /><button className="frame-edit-button" aria-label={`Edit ${asset.name}`} onClick={() => setEditingAssetId(asset.id)}><Pencil size={12} /></button><button className="remove-selection" aria-label={`Remove ${role}`} onClick={() => setSelections(current => current.filter(s => s.role !== role))}><X size={12} /></button></> : <button onClick={() => chooseFile(role)} disabled={uploading}><ImagePlus size={20} /><span>{role === 'first_frame' ? 'First frame' : 'Last frame'}</span><small>Upload an image</small></button>}</div>;
+                return <div className="frame-slot" key={role}>{asset ? <><img src={asset.prepared?.url ?? asset.url} alt={role.replace('_', ' ')} /><button className="frame-edit-button" aria-label={`Edit ${asset.name}`} onClick={() => openAssetEditor(asset, true)}><Pencil size={12} /></button><button className="remove-selection" aria-label={`Remove ${role}`} onClick={() => setSelections(current => current.filter(s => s.role !== role))}><X size={12} /></button></> : <button onClick={() => chooseFile(role)} disabled={uploading}><ImagePlus size={20} /><span>{role === 'first_frame' ? 'First frame' : 'Last frame'}</span><small>Upload an image</small></button>}</div>;
               })}{!model?.supported_frame_images?.length && <p className="hint">This model does not expose frame control. Choose another model or use reference assets.</p>}</div> : <>
                 <button className={`upload-zone ${dragging ? 'dragging' : ''}`} disabled={uploading} onClick={() => chooseFile()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}>
                   <span className="upload-icon">{uploading ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><span><strong>{uploading ? `Saving originals… ${Math.round(uploadProgress * 100)}%` : 'Drop assets here, or browse'}<span className="upload-plus"> +</span></strong><small>Full-quality originals <span>·</span> Up to {formatBytes(maxUploadBytes)} each</small></span>
                 </button>
-                {selectedAssets.length > 0 && <div className="attached-assets">{selectedAssets.map(({ asset }) => asset && <div className="attached-asset" key={asset.id}><span className="asset-thumb">{assetThumb(asset)}</span><span title={`${asset.name} · ${asset.prepared ? 'Prepared: ' : 'Original: '}${inputSummary(asset)}`}>{asset.name}{asset.prepared ? ' · Edited' : ''}</span>{editAssetButton(asset)}<button className="icon-button small" aria-label={`Detach ${asset.name}`} onClick={() => setSelections(current => current.filter(s => s.id !== asset.id))}><X size={12} /></button></div>)}</div>}
+                {selectedAssets.length > 0 && <div className="attached-assets">{selectedAssets.map(({ asset }) => asset && <div className="attached-asset" key={asset.id}><span className="asset-thumb">{assetThumb(asset)}</span><span title={`${asset.name} · ${asset.prepared ? 'Prepared: ' : 'Original: '}${inputSummary(asset)}`}>{asset.name}{asset.prepared ? ' · Edited' : ''}</span>{editAssetButton(asset, true)}<button className="icon-button small" aria-label={`Detach ${asset.name}`} onClick={() => setSelections(current => current.filter(s => s.id !== asset.id))}><X size={12} /></button></div>)}</div>}
               </>}
+              {selectedAssets.some(selection => selection.missing) && <div className="info-note">A saved reference is unavailable. Remove or replace it before generating.</div>}
               {selectedAssets.some(s => s.asset?.kind !== 'image') && <div className="info-note">Video and audio guidance requires a supporting provider, such as BytePlus with Seedance 2+. Other providers may ignore these assets.</div>}
               <div className="composer-divider" />
               <div className="field-label"><label>Generation model</label><span className="live-label"><span className="green-dot" /> OpenRouter</span></div>
@@ -313,9 +349,9 @@ export default function App() {
       </main>
     </div>
     <input className="sr-only" tabIndex={-1} aria-label="Upload media files" ref={fileRef} type="file" multiple accept="image/*,video/*,audio/*" onChange={e => void uploadFiles(Array.from(e.target.files || []), uploadRole.current)} />
-    {editingAsset && <AssetEditor key={editingAsset.id} asset={editingAsset} onUpdate={updated => setAssets(current => current.map(asset => asset.id === updated.id ? updated : asset))} onClose={() => setEditingAssetId(null)} />}
-    {modal === 'prompts' && <SavedPrompts onClose={() => setModal(null)} onUse={saved => { setPrompt(saved.text); setActiveSavedPrompt(saved); setModal(null); navigate('studio'); setToast(`Loaded “${saved.title}” · version ${saved.version}.`); }} onEdit={saved => { setModal(null); setPromptToSave({ text: saved.text, saved, fromComposer: false }); }} onUpdate={saved => { if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); }} onRemove={id => { if (activeSavedPrompt?.id === id) setActiveSavedPrompt(null); }} />}
-    {promptToSave && <SavePrompt text={promptToSave.text} saved={promptToSave.saved} onClose={() => setPromptToSave(null)} onSaved={saved => { if (promptToSave.fromComposer) { setPrompt(saved.text); setActiveSavedPrompt(saved); } else if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); setPromptToSave(null); setToast(`Saved “${saved.title}” · version ${saved.version}.`); }} />}
+    {editingAsset && <AssetEditor key={editingAsset.id} asset={editingAsset} initialPrepared={editingInput} onUpdate={updateEditedAsset} onClose={() => { setEditingAssetId(null); setEditingInput(undefined); }} />}
+    {modal === 'prompts' && <SavedPrompts onClose={() => setModal(null)} onUse={saved => { loadSavedPrompt(saved); setModal(null); navigate('studio'); setToast(`Loaded “${saved.title}” · version ${saved.version}.`); }} onEdit={saved => { setModal(null); setPromptToSave({ text: saved.text, saved, assets: saved.assets, fromComposer: false }); }} onUpdate={saved => { if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); }} onRemove={id => { if (activeSavedPrompt?.id === id) setActiveSavedPrompt(null); }} />}
+    {promptToSave && <SavePrompt text={promptToSave.text} saved={promptToSave.saved} assets={promptToSave.assets} onClose={() => setPromptToSave(null)} onSaved={saved => { if (promptToSave.fromComposer) { loadSavedPrompt(saved); } else if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); setPromptToSave(null); setToast(`Saved “${saved.title}” · version ${saved.version}.`); }} />}
     {toast && <div className="toast" role="status"><Check size={17} /><span>{toast}</span><button className="icon-button small" aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}
 
     {modal === 'settings' && <Modal title="Connect your studio" onClose={() => { setModal(null); setApiKey(''); setConnectionError(''); }}><div className="connection-illustration"><KeyRound size={28} /></div><p className="modal-intro">One key. A world of possibilities.</p><p className="modal-description">Connect OpenRouter to generate with Wan, Seedance, Veo, and other available video models. Generation costs are billed to your OpenRouter account.</p>{connection.connected && <div className="connected-state"><Check size={17} />{connection.source === 'environment' ? 'Using your server’s environment key.' : 'Your studio is connected.'}</div>}<form onSubmit={e => { e.preventDefault(); void connect(); }}><label className="input-label" htmlFor="api-key">OpenRouter API key</label><input autoComplete="off" id="api-key" type="password" placeholder="sk-or-v1-…" value={apiKey} onChange={e => setApiKey(e.target.value)} required minLength={10} /><p className="hint"><ShieldCheck size={12} /> Your key is held in server memory for up to 24 hours of inactivity. It is never saved in browser storage or on disk.</p>{connectionError && <div className="form-error" role="alert">{connectionError}</div>}<button type="submit" className="primary-button full-width" disabled={connecting || apiKey.length < 10}>{connecting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={15} />}{connecting ? 'Checking your key…' : connection.connected ? 'Update API key' : 'Connect OpenRouter'}<ArrowRight size={15} /></button></form><div className="modal-bottom"><a href="https://openrouter.ai/settings/keys" target="_blank" rel="noreferrer">Get an API key <ExternalLink size={12} /></a>{connection.source === 'session' && <button className="text-button danger" onClick={async () => { try { setConnection(await api<Connection>('/connection', { method: 'DELETE' })); setToast('Session key removed.'); } catch (e) { setConnectionError(errorText(e)); } }}>Remove session key</button>}</div></Modal>}

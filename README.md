@@ -88,7 +88,11 @@ Your original stays in the library byte for byte. Photos are prepared as PNG, vi
 
 Click **Save prompt** above the prompt field and give your idea a name. Find it later in **Saved prompts**, then choose **Use prompt** to load it into the studio. After making changes, choose **Save revision**.
 
+Attached references are saved too, including the exact crop, resize, video trim, or audio trim you chose. Loading a prompt brings those inputs back, even if you have since edited the library asset again. You can review or remove the included references before saving.
+
 Open a saved prompt’s **History** to compare earlier versions. **Restore this version** makes that version current by adding a new revision; the versions that followed it stay available. **Save as new prompt** lets you branch an idea into a separate saved prompt.
+
+Each revision keeps its own reference selections and edits. To keep that history usable, an asset used by any saved revision stays in your library until the saved prompt is deleted.
 
 ![Frame’s saved prompt history showing preserved revisions and a restore action](docs/screenshots/prompt-history.png)
 
@@ -160,7 +164,7 @@ Asset edits create a separate prepared file. The original is never overwritten, 
 
 Video and audio references need an HTTPS link that OpenRouter can fetch. On a local install, Frame starts a separate, file-only Cloudflare Quick Tunnel when needed. It shares only temporary copies of the selected model inputs through unguessable links, and revokes those links when the generation reaches a final status. Links expire after two hours unless an active job renews them. Your studio, API key, and other library files are not served through that tunnel. Cloudflare carries the reference transfer; OpenRouter and the provider receive the selected input.
 
-The first video/audio reference may take a little longer while HTTPS sharing starts. The `cloudflared` helper is installed automatically by the dependency or on first use. Hosted installations can configure their own stable HTTPS origin instead.
+The first video/audio reference may take a little longer while HTTPS sharing starts. Frame checks multiple DNS services and verifies that its reference server can be reached over HTTPS before submitting a generation. DNS checks can take up to two minutes; if they time out, retrying reuses the same address while it warms up. The helper stays available for ten minutes after its last reference is released. The `cloudflared` helper is installed automatically by the dependency or on first use. Hosted installations can configure their own stable HTTPS origin instead.
 
 Saved prompts and their version histories are stored locally with your workspace. They survive server restarts; reopen the studio in the same browser to find them.
 

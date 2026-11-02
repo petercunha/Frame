@@ -115,6 +115,13 @@ export interface SavedPrompt {
   version: number;
   createdAt: string;
   updatedAt: string;
+  assets: PromptAsset[];
+}
+export interface PromptAsset {
+  id: string;
+  role: AssetRole;
+  preparedId: string | null;
+  snapshot: Asset;
 }
 export interface PromptVersion {
   version: number;
@@ -122,6 +129,7 @@ export interface PromptVersion {
   text: string;
   createdAt: string;
   restoredFrom?: number;
+  assets: PromptAsset[];
 }
 
 // Only unambiguous output-second SKUs are used. Other pricing schemes need

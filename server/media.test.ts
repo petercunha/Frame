@@ -176,6 +176,73 @@ test('input versions remain stable during subsequent edits, persist, and can be 
   await agent.get(first.prepared!.url).expect(404);
 });
 
+test('saved prompt revisions preserve exact edited references and restore the same bytes after later edits', async () => {
+  const agent = request.agent(studio.app);
+  const original = (await agent.post('/api/assets').attach('files', picture, 'saved-reference.png')).body.assets[0] as Asset;
+  await agent.post(`/api/assets/${original.id}/prepare`).send({ crop: { x: 0, y: 0, width: 0.5, height: 1 }, maxWidth: 100, maxHeight: 100 }).expect(202);
+  const first = await prepared(agent, original.id);
+  const saved = (await agent.post('/api/prompts').send({ title: 'Reference study', text: 'A cinematic color study', assets: [{ id: original.id, role: 'reference' }] }).expect(201)).body.prompt;
+  assert.equal(saved.assets[0].preparedId, first.prepared!.id);
+  assert.equal(saved.assets[0].snapshot.prepared.metadata.width, 100);
+  assert.equal(saved.assets[0].snapshot.filename, undefined);
+  assert.equal(saved.assets[0].snapshot.owner, undefined);
+  await agent.post(`/api/assets/${original.id}/prepare`).send({ maxWidth: 40, maxHeight: 40 }).expect(202);
+  const second = await prepared(agent, original.id);
+  const loaded = (await agent.get(`/api/prompts/${saved.id}`).expect(200)).body.prompt;
+  assert.equal(loaded.assets[0].preparedId, first.prepared!.id, 'loading never silently switches to the latest library edit');
+  await agent.post('/api/jobs').send({ model: 'test/video', prompt: loaded.text, assets: loaded.assets }).expect(202);
+  const payload = Buffer.from((submitted.input_references as { image_url: { url: string } }[])[0].image_url.url.split(',')[1], 'base64');
+  const metadata = await sharp(payload).metadata();
+  assert.deepEqual([metadata.width, metadata.height], [100, 100]);
+  const pixel = await sharp(payload).raw().toBuffer(); assert.equal(pixel[0], 255); assert.equal(pixel[2], 0);
+  await agent.put(`/api/prompts/${saved.id}`).send({ title: saved.title, text: saved.text, assets: [{ id: original.id, role: 'reference', preparedId: second.prepared!.id }], expectedVersion: 1 }).expect(200);
+  const restored = (await agent.post(`/api/prompts/${saved.id}/restore`).send({ version: 1, expectedVersion: 2 }).expect(200)).body;
+  assert.equal(restored.prompt.assets[0].preparedId, first.prepared!.id);
+  assert.equal(restored.versions.find((version: { version: number }) => version.version === 2).assets[0].preparedId, second.prepared!.id);
+  await agent.delete(`/api/assets/${original.id}`).expect(409);
+  await agent.get(first.prepared!.url).expect(200);
+  const reloaded = new Store(store.directory); await reloaded.init();
+  assert.equal(reloaded.data.prompts.find(prompt => prompt.id === saved.id)!.assets[0].preparedId, first.prepared!.id);
+  await agent.delete(`/api/prompts/${saved.id}`).expect(204);
+  await agent.delete(`/api/assets/${original.id}`).expect(204);
+});
+
+test('an explicitly unedited saved reference stays original after a prepared version is added', async () => {
+  const agent = request.agent(studio.app);
+  const original = (await agent.post('/api/assets').attach('files', picture, 'original-reference.png')).body.assets[0] as Asset;
+  const saved = (await agent.post('/api/prompts').send({ title: 'Original study', text: 'Use the original', assets: [{ id: original.id, role: 'first_frame', preparedId: null }] }).expect(201)).body.prompt;
+  await agent.post(`/api/assets/${original.id}/prepare`).send({ maxWidth: 40 }).expect(202);
+  await prepared(agent, original.id);
+  await agent.post('/api/jobs').send({ model: 'test/video', prompt: saved.text, assets: saved.assets }).expect(202);
+  const payload = Buffer.from((submitted.frame_images as { image_url: { url: string } }[])[0].image_url.url.split(',')[1], 'base64');
+  assert.equal(digest(payload), digest(picture));
+  assert.equal(saved.assets[0].role, 'first_frame');
+  assert.equal(saved.assets[0].snapshot.prepared, undefined);
+});
+
+test('saved video and audio references preserve their trims, crop, size, and mute settings', async () => {
+  const agent = request.agent(studio.app);
+  const video = (await agent.post('/api/assets').attach('files', await readFile(videoPath()), 'saved-take.mp4')).body.assets[0] as Asset;
+  const audio = (await agent.post('/api/assets').attach('files', await readFile(audioPath()), 'saved-audio.wav')).body.assets[0] as Asset;
+  const videoEdits = { start: 1.1, end: 2.35, crop: { x: 0.25, y: 0, width: 0.5, height: 1 }, maxWidth: 80, maxHeight: 80, mute: true };
+  await agent.post(`/api/assets/${video.id}/prepare`).send(videoEdits).expect(202);
+  const firstVideo = await prepared(agent, video.id);
+  await agent.post(`/api/assets/${audio.id}/prepare`).send({ start: 0.4, end: 1.3 }).expect(202);
+  const firstAudio = await prepared(agent, audio.id);
+  const saved = (await agent.post('/api/prompts').send({ title: 'Sound and movement', text: 'Use this moment', assets: [{ id: video.id, role: 'reference' }, { id: audio.id, role: 'reference' }] }).expect(201)).body.prompt;
+  await agent.post(`/api/assets/${video.id}/prepare`).send({ start: 0, end: 0.5 }).expect(202);
+  await prepared(agent, video.id);
+  await agent.delete(`/api/assets/${audio.id}/prepared`).expect(200);
+  const loaded = (await agent.get(`/api/prompts/${saved.id}`).expect(200)).body.prompt;
+  assert.equal(loaded.assets[0].preparedId, firstVideo.prepared!.id);
+  assert.deepEqual(loaded.assets[0].snapshot.prepared.edits, videoEdits);
+  assert.deepEqual(loaded.assets[0].snapshot.prepared.metadata, firstVideo.prepared!.metadata);
+  assert.equal(loaded.assets[1].preparedId, firstAudio.prepared!.id);
+  assert.deepEqual(loaded.assets[1].snapshot.prepared.edits, firstAudio.prepared!.edits);
+  await agent.get(loaded.assets[0].snapshot.prepared.url).set('Range', 'bytes=0-19').expect(206);
+  await agent.get(loaded.assets[1].snapshot.prepared.url).expect(200);
+});
+
 test('invalid trim/crop requests fail before processing and preserve the previous input', async () => {
   const agent = request.agent(studio.app);
   const image = (await agent.post('/api/assets').attach('files', picture, 'validation.png')).body.assets[0] as Asset;

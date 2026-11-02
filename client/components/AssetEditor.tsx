@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowRight, AudioLines, Check, Crop, Film, Image, LoaderCircle, LockKeyhole, Maximize2, Pause, Play, RotateCcw, Scissors, Volume2 } from 'lucide-react';
-import type { Asset, AssetEdits, CropRegion } from '../../shared/types';
+import type { Asset, AssetEdits, CropRegion, PreparedAsset } from '../../shared/types';
 import { preparedDimensions } from '../../shared/types';
 import { api } from '../api';
 import { formatBytes, formatTime, inputSummary, isPreparing } from '../media';
@@ -16,7 +16,7 @@ function initialEdits(asset: Asset): AssetEdits {
   };
 }
 
-export default function AssetEditor({ asset: initialAsset, onUpdate, onClose }: { asset: Asset; onUpdate: (asset: Asset) => void; onClose: () => void }) {
+export default function AssetEditor({ asset: initialAsset, initialPrepared, onUpdate, onClose }: { asset: Asset; initialPrepared?: PreparedAsset | null; onUpdate: (asset: Asset, inputChanged?: boolean) => void; onClose: () => void }) {
   const [asset, setAsset] = useState(initialAsset);
   const [draft, setDraft] = useState<AssetEdits | null>(null);
   const [loading, setLoading] = useState(true);
@@ -42,7 +42,8 @@ export default function AssetEditor({ asset: initialAsset, onUpdate, onClose }: 
     let active = true;
     api<{ asset: Asset }>(`/assets/${initialAsset.id}/editor`).then(result => {
       if (!active) return;
-      setAsset(result.asset); setDraft(initialEdits(result.asset)); updateCallback.current(result.asset);
+      const inputAsset = initialPrepared === undefined ? result.asset : { ...result.asset, prepared: initialPrepared ?? undefined };
+      setAsset(inputAsset); setDraft(initialEdits(inputAsset)); updateCallback.current(result.asset);
     }).catch(error => { if (active) setError(errorText(error)); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [initialAsset.id]);
@@ -55,7 +56,8 @@ export default function AssetEditor({ asset: initialAsset, onUpdate, onClose }: 
       try {
         const result = await api<{ asset: Asset }>(`/assets/${asset.id}/editor`);
         if (!active) return;
-        setAsset(result.asset); updateCallback.current(result.asset);
+        const inputChanged = result.asset.preparation?.status === 'completed' && savedId.current === result.asset.prepared?.id;
+        setAsset(initialPrepared !== undefined && savedId.current === null ? { ...result.asset, prepared: initialPrepared ?? undefined } : result.asset); updateCallback.current(result.asset, inputChanged);
         if (!isPreparing(result.asset)) {
           if (result.asset.preparation?.status === 'completed' && result.asset.prepared && savedId.current === result.asset.prepared.id) {
             setDraft(result.asset.prepared.edits); setView('prepared'); setPreviewError(false); savedId.current = null;
@@ -89,7 +91,7 @@ export default function AssetEditor({ asset: initialAsset, onUpdate, onClose }: 
     try {
       const result = await api<{ asset: Asset }>(`/assets/${asset.id}/prepare`, { method: 'POST', body: JSON.stringify(draft) });
       savedId.current = result.asset.preparation?.id ?? null;
-      setAsset(result.asset); updateCallback.current(result.asset);
+      setAsset(result.asset); updateCallback.current(result.asset, true);
       if (result.asset.preparation?.status === 'completed') { setView('prepared'); setDraft(result.asset.prepared!.edits); }
     } catch (error) { setError(errorText(error)); }
     finally { setSaving(false); }
@@ -98,7 +100,7 @@ export default function AssetEditor({ asset: initialAsset, onUpdate, onClose }: 
     setSaving(true); setError('');
     try {
       const result = await api<{ asset: Asset }>(`/assets/${asset.id}/prepared`, { method: 'DELETE' });
-      setAsset(result.asset); updateCallback.current(result.asset); setDraft(initialEdits(result.asset)); setView('edit');
+      setAsset(result.asset); updateCallback.current(result.asset, true); setDraft(initialEdits(result.asset)); setView('edit');
     } catch (error) { setError(errorText(error)); }
     finally { setSaving(false); }
   }

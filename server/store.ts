@@ -18,6 +18,10 @@ export class Store {
     await mkdir(this.prepared, { recursive: true });
     try { this.data = { prompts: [], ...JSON.parse(await readFile(resolve(this.directory, 'studio.json'), 'utf8')) }; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    for (const prompt of this.data.prompts) {
+      prompt.assets ??= [];
+      for (const version of prompt.versions) version.assets ??= [];
+    }
     for (const asset of this.data.assets) {
       if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) {
         asset.preparation.status = 'failed';

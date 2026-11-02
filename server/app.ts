@@ -184,6 +184,8 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   app.delete('/api/assets/:id', async (req, res) => {
     const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
     if (!asset) throw new ApiError(404, 'Asset not found.');
+    const usedBy = store.data.prompts.find(prompt => prompt.owner === req.studioOwner && prompt.versions.some(version => version.assets.some(reference => reference.id === asset.id)));
+    if (usedBy) throw new ApiError(409, `This asset is kept by “${usedBy.title}” and its version history. Delete that saved prompt first if you want to remove the original.`);
     if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) throw new ApiError(409, 'Wait for preparation to finish before removing this asset.');
     store.data.assets = store.data.assets.filter(a => a !== asset);
     await store.save();
