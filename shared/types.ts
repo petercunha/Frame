@@ -28,6 +28,50 @@ export interface Asset {
   size: number;
   createdAt: string;
   url: string;
+  metadata?: MediaMetadata;
+  prepared?: PreparedAsset;
+  preparation?: { id: string; status: 'queued' | 'processing' | 'completed' | 'failed'; progress: number; error?: string };
+}
+
+export interface MediaMetadata {
+  width?: number;
+  height?: number;
+  duration?: number;
+  hasAudio?: boolean;
+  animated?: boolean;
+}
+
+export interface CropRegion { x: number; y: number; width: number; height: number }
+export interface AssetEdits {
+  crop?: CropRegion | null;
+  maxWidth?: number;
+  maxHeight?: number;
+  start?: number;
+  end?: number;
+  mute?: boolean;
+}
+export interface PreparedAsset {
+  id: string;
+  mime: string;
+  size: number;
+  url: string;
+  metadata: MediaMetadata;
+  edits: AssetEdits;
+  createdAt: string;
+}
+
+export const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024;
+export const MAX_REFERENCE_BYTES = 25 * 1024 * 1024;
+export function preparedDimensions(metadata: MediaMetadata, edits: AssetEdits, kind: AssetKind) {
+  if (!metadata.width || !metadata.height) return null;
+  const crop = edits.crop;
+  let width = Math.max(1, Math.floor(metadata.width * (crop?.width ?? 1)));
+  let height = Math.max(1, Math.floor(metadata.height * (crop?.height ?? 1)));
+  const scale = Math.min(1, edits.maxWidth ? edits.maxWidth / width : 1, edits.maxHeight ? edits.maxHeight / height : 1);
+  width = Math.max(1, Math.floor(width * scale));
+  height = Math.max(1, Math.floor(height * scale));
+  if (kind === 'video') { width = Math.max(2, width - width % 2); height = Math.max(2, height - height % 2); }
+  return { width, height };
 }
 
 export interface GenerationInput {
@@ -41,7 +85,7 @@ export interface GenerationInput {
   seed?: number;
   upscale_factor?: number;
   creativity?: number;
-  assets: { id: string; role: AssetRole }[];
+  assets: { id: string; role: AssetRole; preparedId?: string | null }[];
   provider?: { options: Record<string, Record<string, unknown>> };
 }
 

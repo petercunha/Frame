@@ -25,6 +25,7 @@ Describe a scene, choose how it should look, and let your selected video model b
 
 - **Start with words.** Write a prompt or borrow a starting point from the inspiration gallery.
 - **Bring your own ingredients.** Drop in photos, video clips, or audio, and reuse them from your asset library.
+- **Keep the original. Edit the input.** Crop images or videos, choose maximum dimensions, and trim footage or sound. Your full-quality originals stay untouched.
 - **Frame the scene.** Use an image to guide the first or last frame on models that support it.
 - **Make it your own.** Choose duration, resolution, aspect ratio, and audio, with more controls when a model offers them.
 - **Keep your creative flow.** Follow generation progress while working on your next idea. Run up to three generations at once.
@@ -34,14 +35,15 @@ No graphics card or local AI installation needed. OpenRouter handles the generat
 
 ## Get started
 
-You’ll need two things:
+You’ll need:
 
 1. **[Node.js](https://nodejs.org/)** — version 22.12 or newer. The current LTS version is a good choice.
 2. **An [OpenRouter API key](https://openrouter.ai/settings/keys)** and credits for generating videos. Think of the key as the connection between your studio and the video models.
+3. **[FFmpeg](https://ffmpeg.org/download.html)** for editing video and audio. On a Mac with Homebrew, run `brew install ffmpeg`. On Windows or Linux, use the download page and make sure both `ffmpeg` and `ffprobe` are available in your terminal. Image editing works without it.
 
 ### 1. Open the project
 
-Clone this repository, or choose **Code → Download ZIP** on GitHub and unzip it. Open a terminal in the `GenVideoStudio` folder.
+Clone this repository, or choose **Code → Download ZIP** on GitHub and unzip it. Open a terminal in the `Frame` folder.
 
 ### 2. Start your studio
 
@@ -71,6 +73,16 @@ To open the studio another day, run `npm run dev` again. To stop it, press **Ctr
 
 ## Take a look
 
+### Big originals. Just the right input.
+
+Have a long 4K recording, but only need five seconds? Upload the original to **Asset library**, then click its **pencil icon**. Scrub to the moment you want and choose **Use 5s here**, or enter exact start and end times. Frame the shot, set a maximum size, and click **Save input**.
+
+![Frame’s reference editor cropping a full-quality forest photograph into a smaller square input](docs/screenshots/asset-editor.png)
+
+Switch to **Prepared input** to see exactly what will be sent to the model. You can close the editor while preparation runs, reopen it to adjust your edits, or choose **Use original input** to undo them. Edit icons are also available on attached references and frame images in the studio.
+
+Your original stays in the library byte for byte. Photos are prepared as PNG, video as MP4, and audio as WAV. Prepared inputs keep their proportions, never upscale the source, and must fit within 25 MB each.
+
 ### Choose the right model for your idea
 
 Search available models and compare their supported settings. The studio updates its controls when you choose a model.
@@ -96,6 +108,8 @@ Search available models and compare their supported settings. The studio updates
 | A vertical video | Pick **9:16** under Aspect ratio, when available. |
 | A quick experiment | Start with a shorter clip and a lower resolution. |
 | To try a variation | Find the generation in **My creations** and choose **Reuse prompt**. |
+| Five seconds from a long recording | Open the asset editor, scrub to the moment, and click **Use 5s here**. |
+| A smaller reference without losing the original | Set **Max width** and **Max height** in the editor, then **Save input**. |
 
 **Mac:** ⌘ + Enter · **Windows / Linux:** Ctrl + Enter — generate from the prompt field.
 
@@ -111,7 +125,9 @@ Frame is free, open-source software. Video generation uses your OpenRouter accou
 <details>
 <summary><strong>Which files can I upload?</strong></summary>
 
-Common image, video, and audio formats are supported, including JPG, PNG, WebP, GIF, AVIF, MP4, MOV, WebM, MP3, WAV, OGG, FLAC, M4A, and AAC. You can upload up to 12 files at once, with a limit of 25 MB each. A generation can include up to 50 MB of reference files in total.
+Common image, video, and audio formats are supported, including JPG, PNG, WebP, GIF, AVIF, MP4, MOV, WebM, MP3, WAV, OGG, FLAC, M4A, and AAC. You can upload up to 12 originals at once, with a default limit of 10 GB each. Uploads stream directly to local storage, so long sources stay at their original quality. The limit can be changed in the settings file described in the development guide.
+
+AI inputs have a separate limit: 25 MB per asset and 50 MB per generation in total. Use the editor to trim or resize large originals before generating. Animated image originals are preserved; a prepared image uses their first frame.
 
 Images can be used as references or, when supported, first and last frames. Video and audio guidance requires a compatible provider, such as BytePlus with Seedance 2 or newer. Other providers may ignore those references. Frame images and reference assets are separate generation modes, so use one mode at a time.
 
@@ -130,6 +146,8 @@ Each model has its own capabilities. Frame reads those from OpenRouter and shows
 A key entered in the app stays in the server’s memory and expires after 24 hours of inactivity. Restarting the server clears it. Frame never saves that key in browser storage or on disk.
 
 Uploads and generation history live in the local `data` folder. Your browser session identifies your workspace, so reopen Frame in the same browser to see it again. Your prompt draft is saved in that browser. References are sent to OpenRouter and the selected provider when you generate; their data policies apply.
+
+Asset edits create a separate prepared file. The original is never overwritten, and only your prepared input is sent when one is saved. Unedited assets use the original if it fits within the input limits.
 
 Generated videos are fetched from OpenRouter. Download the clips you want to keep, since availability depends on the service’s retention period.
 

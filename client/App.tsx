@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
-import { ArrowDownToLine, ArrowRight, AudioLines, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, AudioLines, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
 import type { Asset, AssetRole, Connection, GenerationInput, VideoJob, VideoModel } from '../shared/types';
-import { estimateCost, terminalStatuses } from '../shared/types';
+import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, terminalStatuses } from '../shared/types';
 import Modal from './components/Modal';
-import { api } from './api';
+import { api, uploadAssets } from './api';
+import AssetEditor from './components/AssetEditor';
+import { formatBytes, inputSummary, isPreparing } from './media';
 
 type View = 'studio' | 'library' | 'assets' | 'inspiration';
 type Selection = GenerationInput['assets'][number];
@@ -13,7 +15,6 @@ const inspiration = [
   { title: 'Make the everyday cinematic', category: 'LIFESTYLE', image: 'https://images.unsplash.com/photo-1442512595331-e89e73853f31?auto=format&fit=crop&w=800&q=85', prompt: 'An intimate close-up of a ceramic coffee cup on a sunlit wooden table. Wisps of steam curl upward in slow motion as morning light pours through a nearby window. Shallow depth of field, warm neutral colors, subtle camera push-in, 35mm film aesthetic.' },
 ];
 const labels: Record<VideoJob['status'], string> = { pending: 'In queue', in_progress: 'Generating', completed: 'Ready', failed: 'Failed', cancelled: 'Cancelled', expired: 'Expired' };
-const formatBytes = (size: number) => size < 1024 * 1024 ? `${Math.round(size / 1024)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`;
 const money = (cost: number) => `$${cost.toFixed(cost < 0.01 ? 4 : 2)}`;
 const modelName = (model: VideoModel | undefined) => model?.name.split(': ').slice(-1)[0] || 'Choose a model';
 const errorText = (error: unknown) => error instanceof Error ? error.message : 'Something went wrong. Please try again.';
@@ -46,6 +47,9 @@ export default function App() {
   const [previewTab, setPreviewTab] = useState<'preview' | 'history'>('preview');
   const [submitting, setSubmitting] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [maxUploadBytes, setMaxUploadBytes] = useState(DEFAULT_MAX_UPLOAD_BYTES);
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [formError, setFormError] = useState('');
   const [toast, setToast] = useState('');
@@ -64,6 +68,10 @@ export default function App() {
   const activeCount = jobs.filter(j => !terminalStatuses.includes(j.status)).length;
   const completedCount = jobs.filter(j => j.status === 'completed').length;
   const selectedAssets = selections.map(s => ({ ...s, asset: assets.find(a => a.id === s.id) })).filter(s => s.asset !== undefined);
+  const preparingCount = assets.filter(isPreparing).length;
+  const selectedPreparing = selectedAssets.some(s => s.asset && isPreparing(s.asset));
+  const oversizedInput = selectedAssets.find(s => s.asset && (s.asset.prepared?.size ?? s.asset.size) > MAX_REFERENCE_BYTES)?.asset;
+  const editingAsset = assets.find(asset => asset.id === editingAssetId);
   const cost = estimateCost(model, model?.supported_durations?.length ? duration : undefined, resolution, audio);
 
   async function loadModels() {
@@ -76,10 +84,18 @@ export default function App() {
   }
   useEffect(() => {
     void loadModels();
+    void api<{ maxUploadBytes: number }>('/config').then(result => setMaxUploadBytes(result.maxUploadBytes)).catch(() => {});
     void api<Connection>('/connection').then(setConnection).catch(e => setToast(errorText(e))).finally(() => setConnectionLoaded(true));
     void api<{ assets: Asset[] }>('/assets').then(r => setAssets(r.assets)).catch(e => setToast(errorText(e)));
     void api<{ jobs: VideoJob[] }>('/jobs').then(r => { setJobs(r.jobs); setActiveJobId(r.jobs[0]?.id ?? null); }).catch(e => setToast(errorText(e)));
   }, []);
+  useEffect(() => {
+    if (!preparingCount) return;
+    const timer = setInterval(() => {
+      void api<{ assets: Asset[] }>('/assets').then(result => setAssets(result.assets)).catch(error => setToast(errorText(error)));
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [preparingCount]);
   useEffect(() => { try { localStorage.setItem('frame.prompt', prompt); } catch { /* draft storage unavailable */ } }, [prompt]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(''), 5500); return () => clearTimeout(timer); } }, [toast]);
   useEffect(() => {
@@ -118,15 +134,14 @@ export default function App() {
   }
   async function uploadFiles(files: File[], role: AssetRole = 'reference') {
     if (!files.length || uploading) return;
-    if (files.length > 12 || files.some(f => f.size > 25 * 1024 * 1024)) { setToast('Choose up to 12 files, each 25 MB or smaller.'); return; }
+    if (files.length > 12 || files.some(f => f.size > maxUploadBytes)) { setToast(`Choose up to 12 originals, each ${formatBytes(maxUploadBytes)} or smaller.`); return; }
     if (role !== 'reference' && (files.length > 1 || !files[0].type.startsWith('image/'))) { setToast('Choose one image for a frame.'); return; }
-    setUploading(true); setFormError('');
-    const data = new FormData(); files.forEach(file => data.append('files', file));
+    setUploading(true); setUploadProgress(0); setFormError('');
     try {
-      const result = await api<{ assets: Asset[] }>('/assets', { method: 'POST', body: data });
+      const result = await uploadAssets<{ assets: Asset[] }>(files, setUploadProgress);
       setAssets(current => [...result.assets, ...current]);
       if (view === 'studio') result.assets.forEach(asset => attach(asset, role));
-      setToast(`${result.assets.length === 1 ? 'Asset' : `${result.assets.length} assets`} added to your workspace.`);
+      setToast(`${result.assets.length === 1 ? 'Original' : `${result.assets.length} originals`} saved at full quality. Use the edit icon to prepare your model inputs.`);
     } catch (error) { setFormError(errorText(error)); setToast(errorText(error)); }
     finally { setUploading(false); if (fileRef.current) fileRef.current.value = ''; }
   }
@@ -140,6 +155,7 @@ export default function App() {
     catch (error) { setToast(errorText(error)); }
   }
   async function generate() {
+    if (oversizedInput) { setEditingAssetId(oversizedInput.id); return; }
     if (!connection.connected) { setModal('settings'); return; }
     if (!model) return;
     setFormError('');
@@ -151,7 +167,7 @@ export default function App() {
     }
     if (seed && (!Number.isInteger(Number(seed)) || Number(seed) < 0 || Number(seed) > 2147483647)) { setFormError('Seed must be an integer from 0 to 2147483647.'); return; }
     const input: GenerationInput = {
-      model: modelId, prompt, assets: selections,
+      model: modelId, prompt, assets: selections.map(selection => ({ ...selection, preparedId: assets.find(asset => asset.id === selection.id)?.prepared?.id ?? null })),
       ...(model.supported_durations?.length ? { duration } : {}),
       ...(size ? { size } : { ...(model.supported_resolutions?.length ? { resolution } : {}), ...(model.supported_aspect_ratios?.length ? { aspect_ratio: ratio } : {}) }),
       ...(model.generate_audio === true ? { generate_audio: audio } : {}),
@@ -181,7 +197,8 @@ export default function App() {
   function useInspiration(index: number) { setPrompt(inspiration[index].prompt); navigate('studio'); setTimeout(() => promptRef.current?.focus(), 0); }
   function onDrop(event: DragEvent) { event.preventDefault(); setDragging(false); void uploadFiles(Array.from(event.dataTransfer.files)); }
 
-  const assetThumb = (asset: Asset, large = false) => asset.kind === 'image' ? <img src={asset.url} alt={asset.name} loading="lazy" /> : asset.kind === 'video' ? <Film size={large ? 36 : 20} /> : <AudioLines size={large ? 36 : 20} />;
+  const assetThumb = (asset: Asset, large = false) => asset.kind === 'image' ? <img src={asset.prepared?.url ?? asset.url} alt={asset.name} loading="lazy" /> : asset.kind === 'video' ? <Film size={large ? 36 : 20} /> : <AudioLines size={large ? 36 : 20} />;
+  const editAssetButton = (asset: Asset) => <button className="icon-button edit-attached" aria-label={`Edit ${asset.name}`} title="Crop, trim & resize input" onClick={() => { setModal(null); setEditingAssetId(asset.id); }}><Pencil size={13} /></button>;
   const renderJob = (job: VideoJob, compact = false) => <article key={job.id} className={`job-card ${compact ? 'job-compact' : ''}`}>
     <button className="job-visual" onClick={() => { setActiveJobId(job.id); navigate('studio'); setPreviewTab('preview'); }} aria-label={`View ${job.title}`}>
       {job.status === 'completed' ? <><video src={`/api/jobs/${job.id}/content#t=0.1`} preload="metadata" muted playsInline /><span className="play-dot"><Film size={20} /></span></> : <div className={`job-placeholder ${job.status}`}>
@@ -233,12 +250,12 @@ export default function App() {
               <div className="field-label assets-label"><span>{mode === 'image' ? 'Frame images' : 'Reference assets'} <span className="optional">Optional</span></span><button className="text-button" onClick={() => setModal('assets')}>From library <ChevronRight size={12} /></button></div>
               {mode === 'image' ? <div className="frame-slots">{(['first_frame', 'last_frame'] as const).filter(role => model?.supported_frame_images?.includes(role)).map(role => {
                 const asset = selectedAssets.find(a => a.role === role)?.asset;
-                return <div className="frame-slot" key={role}>{asset ? <><img src={asset.url} alt={role.replace('_', ' ')} /><button className="remove-selection" aria-label={`Remove ${role}`} onClick={() => setSelections(current => current.filter(s => s.role !== role))}><X size={12} /></button></> : <button onClick={() => chooseFile(role)} disabled={uploading}><ImagePlus size={20} /><span>{role === 'first_frame' ? 'First frame' : 'Last frame'}</span><small>Upload an image</small></button>}</div>;
+                return <div className="frame-slot" key={role}>{asset ? <><img src={asset.prepared?.url ?? asset.url} alt={role.replace('_', ' ')} /><button className="frame-edit-button" aria-label={`Edit ${asset.name}`} onClick={() => setEditingAssetId(asset.id)}><Pencil size={12} /></button><button className="remove-selection" aria-label={`Remove ${role}`} onClick={() => setSelections(current => current.filter(s => s.role !== role))}><X size={12} /></button></> : <button onClick={() => chooseFile(role)} disabled={uploading}><ImagePlus size={20} /><span>{role === 'first_frame' ? 'First frame' : 'Last frame'}</span><small>Upload an image</small></button>}</div>;
               })}{!model?.supported_frame_images?.length && <p className="hint">This model does not expose frame control. Choose another model or use reference assets.</p>}</div> : <>
                 <button className={`upload-zone ${dragging ? 'dragging' : ''}`} disabled={uploading} onClick={() => chooseFile()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}>
-                  <span className="upload-icon">{uploading ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><span><strong>{uploading ? 'Adding your assets…' : 'Drop assets here, or browse'}<span className="upload-plus"> +</span></strong><small>Images, video, or audio <span>·</span> Up to 25 MB each</small></span>
+                  <span className="upload-icon">{uploading ? <LoaderCircle className="spin" size={19} /> : <Upload size={19} />}</span><span><strong>{uploading ? `Saving originals… ${Math.round(uploadProgress * 100)}%` : 'Drop assets here, or browse'}<span className="upload-plus"> +</span></strong><small>Full-quality originals <span>·</span> Up to {formatBytes(maxUploadBytes)} each</small></span>
                 </button>
-                {selectedAssets.length > 0 && <div className="attached-assets">{selectedAssets.map(({ asset }) => asset && <div className="attached-asset" key={asset.id}><span className="asset-thumb">{assetThumb(asset)}</span><span title={asset.name}>{asset.name}</span><button className="icon-button small" aria-label={`Detach ${asset.name}`} onClick={() => setSelections(current => current.filter(s => s.id !== asset.id))}><X size={12} /></button></div>)}</div>}
+                {selectedAssets.length > 0 && <div className="attached-assets">{selectedAssets.map(({ asset }) => asset && <div className="attached-asset" key={asset.id}><span className="asset-thumb">{assetThumb(asset)}</span><span title={`${asset.name} · ${asset.prepared ? 'Prepared: ' : 'Original: '}${inputSummary(asset)}`}>{asset.name}{asset.prepared ? ' · Edited' : ''}</span>{editAssetButton(asset)}<button className="icon-button small" aria-label={`Detach ${asset.name}`} onClick={() => setSelections(current => current.filter(s => s.id !== asset.id))}><X size={12} /></button></div>)}</div>}
               </>}
               {selectedAssets.some(s => s.asset?.kind !== 'image') && <div className="info-note">Video and audio guidance requires a supporting provider, such as BytePlus with Seedance 2+. Other providers may ignore these assets.</div>}
               <div className="composer-divider" />
@@ -262,7 +279,7 @@ export default function App() {
                 {!!Object.keys(model?.pricing_skus || {}).length && <details className="pricing-details"><summary>Model pricing</summary>{Object.entries(model!.pricing_skus).map(([key, value]) => <div key={key}><span>{key.replaceAll('_', ' ')}</span><code>{value}</code></div>)}<p className="hint">SKU units vary. Your actual charge appears after generation.</p></details>}
               </div>}
               {formError && <div className="form-error" role="alert">{formError}</div>}
-              <div className="generate-section"><button className="generate-button" disabled={submitting || uploading || !model || activeCount >= 3} onClick={() => void generate()}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}<span>{submitting ? 'Submitting your vision…' : activeCount >= 3 ? '3 generations running' : 'Generate video'}</span><ArrowRight size={17} /></button><div className="generation-footnote"><span>{cost === null ? 'Priced by your selected provider' : <>Estimated <strong>{money(cost)}</strong> / generation</>}</span><span>⌘ / Ctrl + Enter</span></div></div>
+              <div className="generate-section"><button className="generate-button" disabled={submitting || uploading || !model || activeCount >= 3 || selectedPreparing} onClick={() => void generate()}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}<span>{submitting ? 'Submitting your vision…' : activeCount >= 3 ? '3 generations running' : selectedPreparing ? 'Preparing reference assets…' : oversizedInput ? 'Prepare reference input' : 'Generate video'}</span><ArrowRight size={17} /></button><div className="generation-footnote"><span>{cost === null ? 'Priced by your selected provider' : <>Estimated <strong>{money(cost)}</strong> / generation</>}</span><span>⌘ / Ctrl + Enter</span></div></div>
             </section>
 
             <section className="preview-column" aria-label="Video preview">
@@ -284,19 +301,20 @@ export default function App() {
 
         {view === 'library' && <section className="library-section"><div className="library-toolbar"><div className="search-box"><Search size={16} /><input aria-label="Search creations" placeholder="Search your creations…" value={librarySearch} onChange={e => setLibrarySearch(e.target.value)} /></div><select aria-label="Filter by status" value={statusFilter} onChange={e => setStatusFilter(e.target.value)}><option value="all">All generations</option><option value="completed">Ready to watch</option><option value="active">In progress</option><option value="failed">Failed</option></select><span className="subtle-label">{jobs.length} GENERATIONS</span></div><div className="creations-grid">{jobs.filter(job => job.title.toLowerCase().includes(librarySearch.toLowerCase()) && (statusFilter === 'all' || (statusFilter === 'active' ? !terminalStatuses.includes(job.status) : job.status === statusFilter))).map(job => renderJob(job))}</div>{!jobs.length && <div className="empty-library"><Film size={38} strokeWidth={1.3} /><h2>Your first scene is waiting.</h2><p>Create a video, and it will find a home right here.</p><button className="primary-button" onClick={() => navigate('studio')}><Plus size={16} /> Create your first video</button></div>}{!!jobs.length && !jobs.some(job => job.title.toLowerCase().includes(librarySearch.toLowerCase()) && (statusFilter === 'all' || (statusFilter === 'active' ? !terminalStatuses.includes(job.status) : job.status === statusFilter))) && <p className="empty-small">No matching generations. Try a different search or filter.</p>}</section>}
 
-        {view === 'assets' && <section><div className="asset-drop-banner" onDragOver={e => e.preventDefault()} onDrop={onDrop}><Upload size={23} /><div><strong>{uploading ? 'Uploading your assets…' : 'A place for all your creative ingredients.'}</strong><p>Drag in images, footage, or audio. Up to 25 MB per file.</p></div><button className="secondary-button" disabled={uploading} onClick={() => chooseFile()}>Browse files</button></div><div className="asset-library-grid">{assets.map(asset => <article key={asset.id} className="asset-card card"><div className={`asset-preview asset-${asset.kind}`}>{asset.kind === 'image' ? assetThumb(asset, true) : asset.kind === 'video' ? <video src={asset.url} controls preload="metadata" /> : <><AudioLines size={34} /><audio src={asset.url} controls preload="metadata" /></>}</div><div className="asset-card-copy"><h3 title={asset.name}>{asset.name}</h3><p>{asset.kind.toUpperCase()} <span>·</span> {formatBytes(asset.size)}</p><div><button className="text-button" onClick={() => { attach(asset); navigate('studio'); }}>Use as reference <ArrowRight size={12} /></button><button className="icon-button" aria-label={`Delete ${asset.name}`} onClick={() => void removeAsset(asset.id)}><Trash2 size={14} /></button></div></div></article>)}</div>{!assets.length && <div className="empty-library"><FolderOpen size={38} strokeWidth={1.3} /><h2>Your creative toolkit starts here.</h2><p>Upload an image to set the scene, or add footage and sound for a supporting model.</p></div>}</section>}
+        {view === 'assets' && <section><div className="asset-drop-banner" onDragOver={e => e.preventDefault()} onDrop={onDrop}><Upload size={23} /><div><strong>{uploading ? `Saving originals… ${Math.round(uploadProgress * 100)}%` : 'A place for all your creative ingredients.'}</strong><p>Originals are preserved at full quality. Up to {formatBytes(maxUploadBytes)} per file.</p></div><button className="secondary-button" disabled={uploading} onClick={() => chooseFile()}>Browse files</button></div><div className="asset-library-grid">{assets.map(asset => <article key={asset.id} className="asset-card card"><div className={`asset-preview asset-${asset.kind}`}>{asset.kind === 'image' ? assetThumb(asset, true) : asset.kind === 'video' ? <video src={asset.prepared?.url ?? asset.url} controls preload="metadata" /> : <><AudioLines size={34} /><audio src={asset.prepared?.url ?? asset.url} controls preload="metadata" /></>}{asset.prepared && <span className="asset-editor-badge"><Check size={10} /> Input ready</span>}</div><div className="asset-card-copy"><h3 title={asset.name}>{asset.name}</h3><p>{asset.kind.toUpperCase()} <span>·</span> {formatBytes(asset.size)} original</p>{isPreparing(asset) ? <div className="asset-input-state"><LoaderCircle className="spin" size={12} /> Preparing input… {Math.round((asset.preparation?.progress ?? 0) * 100)}%</div> : asset.preparation?.status === 'failed' ? <div className="asset-input-state needs-edit">Preparation failed. Open the editor to try again.</div> : asset.prepared ? <div className="asset-input-state"><Check size={11} /> Input: {inputSummary(asset)}</div> : asset.size > MAX_REFERENCE_BYTES ? <div className="asset-input-state needs-edit">Trim or resize this original before generating.</div> : null}<div><button className="text-button" onClick={() => { attach(asset); navigate('studio'); }}>Use as reference <ArrowRight size={12} /></button><span className="asset-card-tools">{editAssetButton(asset)}<a className="icon-button" aria-label={`Download original ${asset.name}`} href={asset.url} download={asset.name} title="Download original"><ArrowDownToLine size={13} /></a><button className="icon-button" disabled={isPreparing(asset)} aria-label={`Delete ${asset.name}`} onClick={() => void removeAsset(asset.id)}><Trash2 size={14} /></button></span></div></div></article>)}</div>{!assets.length && <div className="empty-library"><FolderOpen size={38} strokeWidth={1.3} /><h2>Your creative toolkit starts here.</h2><p>Upload an image to set the scene, or add footage and sound for a supporting model.</p></div>}</section>}
 
         {view === 'inspiration' && <section className="inspiration-grid inspiration-expanded">{inspiration.map((item, index) => <article className="inspiration-detail card" key={item.title}><img src={item.image} alt={item.title} /><div><span className="eyebrow">{item.category}</span><h2>{item.title}</h2><p>{item.prompt}</p><button className="primary-button" onClick={() => useInspiration(index)}><WandSparkles size={15} /> Use this prompt <ArrowRight size={14} /></button></div></article>)}</section>}
         <footer className="page-footer"><span>Made for the way you imagine.</span><span><span className="footer-mark">f.</span> FRAME VIDEO STUDIO</span></footer>
       </main>
     </div>
     <input className="sr-only" tabIndex={-1} aria-label="Upload media files" ref={fileRef} type="file" multiple accept="image/*,video/*,audio/*" onChange={e => void uploadFiles(Array.from(e.target.files || []), uploadRole.current)} />
+    {editingAsset && <AssetEditor key={editingAsset.id} asset={editingAsset} onUpdate={updated => setAssets(current => current.map(asset => asset.id === updated.id ? updated : asset))} onClose={() => setEditingAssetId(null)} />}
     {toast && <div className="toast" role="status"><Check size={17} /><span>{toast}</span><button className="icon-button small" aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}
 
     {modal === 'settings' && <Modal title="Connect your studio" onClose={() => { setModal(null); setApiKey(''); setConnectionError(''); }}><div className="connection-illustration"><KeyRound size={28} /></div><p className="modal-intro">One key. A world of possibilities.</p><p className="modal-description">Connect OpenRouter to generate with Wan, Seedance, Veo, and other available video models. Generation costs are billed to your OpenRouter account.</p>{connection.connected && <div className="connected-state"><Check size={17} />{connection.source === 'environment' ? 'Using your server’s environment key.' : 'Your studio is connected.'}</div>}<form onSubmit={e => { e.preventDefault(); void connect(); }}><label className="input-label" htmlFor="api-key">OpenRouter API key</label><input autoComplete="off" id="api-key" type="password" placeholder="sk-or-v1-…" value={apiKey} onChange={e => setApiKey(e.target.value)} required minLength={10} /><p className="hint"><ShieldCheck size={12} /> Your key is held in server memory for up to 24 hours of inactivity. It is never saved in browser storage or on disk.</p>{connectionError && <div className="form-error" role="alert">{connectionError}</div>}<button type="submit" className="primary-button full-width" disabled={connecting || apiKey.length < 10}>{connecting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={15} />}{connecting ? 'Checking your key…' : connection.connected ? 'Update API key' : 'Connect OpenRouter'}<ArrowRight size={15} /></button></form><div className="modal-bottom"><a href="https://openrouter.ai/settings/keys" target="_blank" rel="noreferrer">Get an API key <ExternalLink size={12} /></a>{connection.source === 'session' && <button className="text-button danger" onClick={async () => { try { setConnection(await api<Connection>('/connection', { method: 'DELETE' })); setToast('Session key removed.'); } catch (e) { setConnectionError(errorText(e)); } }}>Remove session key</button>}</div></Modal>}
 
     {modal === 'models' && <Modal title="Choose your creative engine" onClose={() => setModal(null)} wide><p className="modal-description">Live video models from OpenRouter. Available settings update automatically.</p><div className="search-box model-search"><Search size={17} /><input autoFocus placeholder="Search models or providers…" aria-label="Search video models" value={modelSearch} onChange={e => setModelSearch(e.target.value)} /></div><div className="model-list">{models.filter(m => `${m.name} ${m.id}`.toLowerCase().includes(modelSearch.toLowerCase())).map(m => <button className={`model-option ${modelId === m.id ? 'chosen' : ''}`} key={m.id} onClick={() => { setModelId(m.id); setModal(null); }}><span className="model-option-icon"><Layers3 size={20} /></span><span><strong>{m.name}{m.id === 'alibaba/wan-3.0' && <span className="recommended-badge">RECOMMENDED</span>}</strong><p>{m.description}</p><small>{m.supported_resolutions?.join(' · ') || 'Model-controlled output'}{m.generate_audio === true && ' · Audio'}{m.supported_durations?.length ? ` · ${Math.min(...m.supported_durations)}–${Math.max(...m.supported_durations)}s` : ''}</small></span>{modelId === m.id ? <Check size={18} /> : <ChevronRight size={16} />}</button>)}</div>{!models.length && <div className="empty-small"><p>{modelsError || 'Loading models…'}</p><button className="secondary-button" onClick={() => void loadModels()}>Refresh models</button></div>}</Modal>}
 
-    {modal === 'assets' && <Modal title="Your creative ingredients" onClose={() => setModal(null)} wide><p className="modal-description">{mode === 'image' ? 'Choose an image for the first or last frame.' : 'Choose assets to guide this generation.'}</p><div className="asset-picker">{assets.filter(a => mode !== 'image' || a.kind === 'image').map(asset => <div className="asset-picker-row" key={asset.id}><span className="asset-picker-thumb">{assetThumb(asset)}</span><div><strong>{asset.name}</strong><small>{asset.kind} · {formatBytes(asset.size)}</small></div>{mode === 'image' ? <div className="frame-picker-actions">{model?.supported_frame_images?.map(role => <button key={role} className="secondary-button" onClick={() => { attach(asset, role as AssetRole); setModal(null); }}>{role === 'first_frame' ? 'First' : 'Last'}</button>)}</div> : <button className={`secondary-button ${selections.some(s => s.id === asset.id) ? 'is-selected' : ''}`} onClick={() => selections.some(s => s.id === asset.id) ? setSelections(current => current.filter(s => s.id !== asset.id)) : attach(asset)}>{selections.some(s => s.id === asset.id) ? <Check size={15} /> : <Plus size={15} />}{selections.some(s => s.id === asset.id) ? 'Added' : 'Add'}</button>}</div>)}</div>{!assets.length && <div className="empty-small"><FolderOpen size={28} /><p>Your asset library is empty. Upload your first creative ingredient.</p></div>}<button className="secondary-button full-width" disabled={uploading} onClick={() => { setModal(null); chooseFile(mode === 'image' ? 'first_frame' : 'reference'); }}><Upload size={15} /> Upload new assets</button></Modal>}
+    {modal === 'assets' && <Modal title="Your creative ingredients" onClose={() => setModal(null)} wide><p className="modal-description">{mode === 'image' ? 'Choose an image for the first or last frame.' : 'Choose assets to guide this generation.'}</p><div className="asset-picker">{assets.filter(a => mode !== 'image' || a.kind === 'image').map(asset => <div className="asset-picker-row" key={asset.id}><span className="asset-picker-thumb">{assetThumb(asset)}</span><div><strong>{asset.name}</strong><small>{asset.kind} · {asset.prepared ? `Input: ${inputSummary(asset)}` : formatBytes(asset.size)}</small></div>{editAssetButton(asset)}{mode === 'image' ? <div className="frame-picker-actions">{model?.supported_frame_images?.map(role => <button key={role} className="secondary-button" onClick={() => { attach(asset, role as AssetRole); setModal(null); }}>{role === 'first_frame' ? 'First' : 'Last'}</button>)}</div> : <button className={`secondary-button ${selections.some(s => s.id === asset.id) ? 'is-selected' : ''}`} onClick={() => selections.some(s => s.id === asset.id) ? setSelections(current => current.filter(s => s.id !== asset.id)) : attach(asset)}>{selections.some(s => s.id === asset.id) ? <Check size={15} /> : <Plus size={15} />}{selections.some(s => s.id === asset.id) ? 'Added' : 'Add'}</button>}</div>)}</div>{!assets.length && <div className="empty-small"><FolderOpen size={28} /><p>Your asset library is empty. Upload your first creative ingredient.</p></div>}<button className="secondary-button full-width" disabled={uploading} onClick={() => { setModal(null); chooseFile(mode === 'image' ? 'first_frame' : 'reference'); }}><Upload size={15} /> Upload new assets</button></Modal>}
   </div>;
 }

@@ -9,17 +9,19 @@ import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import { Store, publicAsset, publicJob, type StoredAsset, type StoredJob } from './store';
 import { OpenRouter, ApiError, type UpstreamJob } from './openrouter';
-import { generationSchema, validateGeneration, buildRequest } from './generation';
-import { terminalStatuses, type AssetKind } from '../shared/types';
+import { generationSchema, validateGeneration, buildRequest, referenceFile } from './generation';
+import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, terminalStatuses, type AssetKind } from '../shared/types';
+import { editsSchema, MediaService } from './media';
 
 declare global { namespace Express { interface Request { studioOwner: string } } }
 
-interface AppOptions { store: Store; router?: OpenRouter; apiKey?: string; pollInterval?: number }
+interface AppOptions { store: Store; router?: OpenRouter; apiKey?: string; pollInterval?: number; maxUploadBytes?: number }
 
-export function createApp({ store, router = new OpenRouter(), apiKey, pollInterval = 5000 }: AppOptions) {
+export function createApp({ store, router = new OpenRouter(), apiKey, pollInterval = 5000, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }: AppOptions) {
   const app = express();
   const keys = new Map<string, { value: string; touched: number }>();
   const polls = new Map<string, ReturnType<typeof setTimeout>>();
+  const media = new MediaService(store);
   const polling = new Set<string>();
   let closed = false;
   const keyFor = (owner: string) => {
@@ -94,6 +96,7 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   };
 
   app.get('/api/health', (_req, res) => { res.json({ ok: true }); });
+  app.get('/api/config', (_req, res) => { res.json({ maxUploadBytes }); });
   app.get('/api/connection', (req, res) => {
     res.json({ connected: !!keyFor(req.studioOwner), source: keys.has(req.studioOwner) ? 'session' : apiKey ? 'environment' : null });
   });
@@ -113,7 +116,7 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
 
   const upload = multer({
     storage: multer.diskStorage({ destination: store.uploads, filename: (_req, _file, done) => done(null, randomUUID()) }),
-    limits: { fileSize: 25 * 1024 * 1024, files: 12, fields: 0 },
+    limits: { fileSize: maxUploadBytes, files: 12, fields: 0 },
   }).array('files', 12);
   app.post('/api/assets', (req, res, next) => {
     upload(req, res, error => {
@@ -143,14 +146,42 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   app.get('/api/assets/:id/content', (req, res) => {
     const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
     if (!asset) throw new ApiError(404, 'Asset not found.');
-    res.type(asset.mime).sendFile(resolve(store.uploads, asset.filename));
+    res.type(asset.mime).sendFile(resolve(store.uploads, asset.filename), { dotfiles: 'allow' });
+  });
+  app.get('/api/assets/:id/editor', async (req, res) => {
+    const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
+    if (!asset) throw new ApiError(404, 'Asset not found.');
+    await media.inspect(asset);
+    res.json({ asset: publicAsset(asset) });
+  });
+  app.post('/api/assets/:id/prepare', async (req, res) => {
+    const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
+    if (!asset) throw new ApiError(404, 'Asset not found.');
+    await media.prepare(asset, editsSchema.parse(req.body));
+    res.status(202).json({ asset: publicAsset(asset) });
+  });
+  app.get('/api/assets/:id/prepared/:versionId/content', (req, res) => {
+    const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
+    const version = asset?.versions?.find(v => v.id === req.params.versionId);
+    if (!version) throw new ApiError(404, 'Prepared input not found.');
+    res.type(version.mime).sendFile(resolve(store.prepared, version.filename), { dotfiles: 'allow' });
+  });
+  app.delete('/api/assets/:id/prepared', async (req, res) => {
+    const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
+    if (!asset) throw new ApiError(404, 'Asset not found.');
+    if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) throw new ApiError(409, 'Wait for preparation to finish before restoring the original input.');
+    delete asset.prepared; delete asset.preparation;
+    await store.save();
+    res.json({ asset: publicAsset(asset) });
   });
   app.delete('/api/assets/:id', async (req, res) => {
     const asset = ownedAssets(req.studioOwner).find(a => a.id === req.params.id);
     if (!asset) throw new ApiError(404, 'Asset not found.');
+    if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) throw new ApiError(409, 'Wait for preparation to finish before removing this asset.');
     store.data.assets = store.data.assets.filter(a => a !== asset);
     await store.save();
     await unlink(resolve(store.uploads, asset.filename)).catch(() => {});
+    await Promise.allSettled((asset.versions ?? []).map(version => unlink(resolve(store.prepared, version.filename))));
     res.status(204).end();
   });
 
@@ -171,7 +202,17 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
       if (!model) throw new ApiError(400, 'That model is no longer available. Choose another model.');
       const assets = ownedAssets(req.studioOwner);
       validateGeneration(input, model, assets);
-      const total = input.assets.reduce((bytes, selection) => bytes + assets.find(a => a.id === selection.id)!.size, 0);
+      input.assets = input.assets.map(selection => {
+        const asset = assets.find(a => a.id === selection.id)!;
+        if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) throw new ApiError(409, 'A selected asset is still being prepared. Wait for it to finish before generating.');
+        return { ...selection, preparedId: selection.preparedId === undefined ? asset.prepared?.id ?? null : selection.preparedId };
+      });
+      const total = input.assets.reduce((bytes, selection) => {
+        const asset = assets.find(a => a.id === selection.id)!;
+        const file = referenceFile(asset, selection.preparedId);
+        if (file.size > MAX_REFERENCE_BYTES) throw new ApiError(413, `“${asset.name}” is larger than 25 MB. Open its editor to trim or resize the input. Your original stays in the library.`);
+        return bytes + file.size;
+      }, 0);
       if (total > 50 * 1024 * 1024) throw new ApiError(413, 'Use at most 50 MB of references per generation.');
       const upstream = await router.submit(key, await buildRequest(input, assets, store.uploads));
       const now = new Date().toISOString();
@@ -208,14 +249,17 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
   app.use('/api', (_req, res) => { res.status(404).json({ error: 'API endpoint not found.' }); });
   const errorHandler: ErrorRequestHandler = (error, _req, res, next) => {
     if (res.headersSent) return next(error);
+    res.type('json');
     if (error instanceof ApiError) return res.status(error.status).json({ error: error.message });
+    if (error.status === 404 || error.code === 'ENOENT') return res.status(404).json({ error: 'This file is no longer available in local storage.' });
+    if (error.status === 416) return res.status(416).json({ error: 'The requested media range is outside the file.' });
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues.map(i => `${i.path.join('.') || 'Request'}: ${i.message}`).join('; ') });
-    if (error instanceof multer.MulterError) return res.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'Each file must be 25 MB or smaller.' : 'Upload up to 12 files at a time, using the files field.' });
+    if (error instanceof multer.MulterError) return res.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? `Each original must be ${Math.round(maxUploadBytes / 1024 / 1024)} MB or smaller.` : 'Upload up to 12 files at a time, using the files field.' });
     if (error.type === 'entity.too.large') return res.status(413).json({ error: 'Request is too large.' });
     if (error instanceof SyntaxError && 'body' in error) return res.status(400).json({ error: 'Request body must be valid JSON.' });
     console.error('Studio request failed:', error instanceof Error ? error.name : 'UnknownError');
     res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
   };
   app.use(errorHandler);
-  return { app, close: () => { closed = true; polls.forEach(clearTimeout); polls.clear(); keys.clear(); } };
+  return { app, close: () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); keys.clear(); } };
 }
