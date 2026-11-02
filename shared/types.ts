@@ -108,6 +108,22 @@ export interface Connection {
   source: 'environment' | 'session' | null;
 }
 
+export interface SavedPrompt {
+  id: string;
+  title: string;
+  text: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface PromptVersion {
+  version: number;
+  title: string;
+  text: string;
+  createdAt: string;
+  restoredFrom?: number;
+}
+
 // Only unambiguous output-second SKUs are used. Other pricing schemes need
 // provider-specific accounting and are intentionally not guessed.
 export function estimateCost(model: VideoModel | undefined, duration: number | undefined, resolution: string, audio: boolean): number | null {

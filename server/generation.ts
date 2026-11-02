@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { ApiError } from './openrouter';
 import type { VideoModel, GenerationInput } from '../shared/types';
 import type { StoredAsset } from './store';
+import type { ReferenceSource } from './reference-host';
 
 export const generationSchema = z.object({
   model: z.string().min(1).max(200), prompt: z.string().trim().max(10_000).default(''),
@@ -62,16 +63,23 @@ export function referenceFile(asset: StoredAsset, preparedId?: string | null) {
   return { filename: version.filename, mime: version.mime, size: version.size, prepared: true };
 }
 
-export async function buildRequest(input: GenerationInput, assets: StoredAsset[], uploads: string, prepared = resolve(uploads, '..', 'prepared')) {
+export async function buildRequest(input: GenerationInput, assets: StoredAsset[], uploads: string, prepared = resolve(uploads, '..', 'prepared'), publish?: (source: ReferenceSource) => Promise<string>) {
   const { assets: selections, ...body } = input;
   const references: Record<string, unknown>[] = [];
   const frames: Record<string, unknown>[] = [];
   for (const selection of selections) {
     const asset = assets.find(a => a.id === selection.id)!;
     const file = referenceFile(asset, selection.preparedId);
-    const bytes = await readFile(resolve(file.prepared ? prepared : uploads, file.filename));
+    const path = resolve(file.prepared ? prepared : uploads, file.filename);
+    let url: string;
+    if (asset.kind === 'image') url = `data:${file.mime};base64,${(await readFile(path)).toString('base64')}`;
+    else {
+      if (!publish) throw new ApiError(503, 'Video and audio references need HTTPS hosting. Restart Frame to enable temporary reference links.');
+      url = await publish({ path, mime: file.mime, kind: asset.kind });
+      if (!url.startsWith('https://')) throw new ApiError(503, 'Reference hosting did not return an HTTPS URL. No generation was submitted.');
+    }
     const type = `${asset.kind}_url`;
-    const reference = { type, [type]: { url: `data:${file.mime};base64,${bytes.toString('base64')}` } };
+    const reference = { type, [type]: { url } };
     if (selection.role === 'reference') references.push(reference);
     else frames.push({ ...reference, frame_type: selection.role });
   }

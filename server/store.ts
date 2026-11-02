@@ -1,13 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import type { Asset, PreparedAsset, VideoJob } from '../shared/types';
+import type { Asset, PreparedAsset, PromptVersion, SavedPrompt, VideoJob } from '../shared/types';
 
 export type StoredAsset = Asset & { owner: string; filename: string; versions?: (PreparedAsset & { filename: string })[] };
 export type StoredJob = VideoJob & { owner: string };
-interface Database { assets: StoredAsset[]; jobs: StoredJob[] }
+export type StoredPrompt = SavedPrompt & { owner: string; versions: PromptVersion[] };
+interface Database { assets: StoredAsset[]; jobs: StoredJob[]; prompts: StoredPrompt[] }
 
 export class Store {
-  data: Database = { assets: [], jobs: [] };
+  data: Database = { assets: [], jobs: [], prompts: [] };
   private writes: Promise<void> = Promise.resolve();
   readonly uploads: string;
   readonly prepared: string;
@@ -15,7 +16,7 @@ export class Store {
   async init() {
     await mkdir(this.uploads, { recursive: true });
     await mkdir(this.prepared, { recursive: true });
-    try { this.data = JSON.parse(await readFile(resolve(this.directory, 'studio.json'), 'utf8')); }
+    try { this.data = { prompts: [], ...JSON.parse(await readFile(resolve(this.directory, 'studio.json'), 'utf8')) }; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     for (const asset of this.data.assets) {
       if (asset.preparation && ['queued', 'processing'].includes(asset.preparation.status)) {

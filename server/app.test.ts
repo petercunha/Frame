@@ -9,6 +9,7 @@ import { OpenRouter } from './openrouter';
 import { Store, type StoredAsset } from './store';
 import { buildRequest, validateGeneration } from './generation';
 import { estimateCost, type GenerationInput, type VideoModel } from '../shared/types';
+import { ReferenceHost } from './reference-host';
 
 const model: VideoModel = {
   id: 'alibaba/wan-3.0', name: 'Alibaba: Wan 3.0', description: 'Test model',
@@ -34,8 +35,13 @@ const fetcher: typeof fetch = async (url, init) => {
   if (path.endsWith('/videos/models')) return json({ data: [model] });
   if (path.endsWith('/key')) return new Headers(init?.headers).get('Authorization') === 'Bearer valid-test-key' ? json({ data: {} }) : json({ error: { message: 'Invalid test key' } }, 401);
   if (path.endsWith('/videos') && init?.method === 'POST') {
-    submitCount++;
     lastSubmission = JSON.parse(String(init.body));
+    const references = lastSubmission.input_references as { type: string; video_url?: { url: string }; audio_url?: { url: string } }[] | undefined;
+    for (const [index, reference] of (references ?? []).entries()) {
+      const url = reference.video_url?.url ?? reference.audio_url?.url;
+      if (url && !url.startsWith('https://')) return json({ error: { message: `Invalid reference URL: input_references[${index}].${reference.type}.url: Only HTTPS URLs are allowed` } }, 400);
+    }
+    submitCount++;
     return json({ id: `upstream-${submitCount}`, status: 'pending' }, 202);
   }
   if (path.endsWith('/content')) {
@@ -48,9 +54,9 @@ const fetcher: typeof fetch = async (url, init) => {
 before(async () => {
   directory = await mkdtemp(join(tmpdir(), 'frame-tests-'));
   store = new Store(directory); await store.init();
-  studio = createApp({ store, router: new OpenRouter('https://mock.invalid/api/v1', fetcher), pollInterval: 10 });
+  studio = createApp({ store, router: new OpenRouter('https://mock.invalid/api/v1', fetcher), pollInterval: 10, references: new ReferenceHost(join(directory, 'exports'), { publicOrigin: 'https://references.example' }) });
 });
-after(async () => { studio.close(); await rm(directory, { recursive: true, force: true }); });
+after(async () => { await studio.close(); await rm(directory, { recursive: true, force: true }); });
 
 test('a key is required; valid session keys are checked and never returned', async () => {
   const agent = request.agent(studio.app);
@@ -150,10 +156,33 @@ test('image, audio, and video reference payloads use the documented discriminate
     await writeFile(join(store.uploads, `reference-${kind}`), 'asset bytes');
     assets.push({ id: kind, owner: 'test', name: kind, kind, mime: `${kind}/example`, filename: `reference-${kind}`, size: 11, createdAt: '', url: '' });
   }
-  const body = await buildRequest({ ...input, assets: kinds.map(id => ({ id, role: 'reference' })) }, assets, store.uploads);
+  const published: string[] = [];
+  const body = await buildRequest({ ...input, assets: kinds.map(id => ({ id, role: 'reference' })) }, assets, store.uploads, store.prepared, async source => { published.push(source.path); return `https://references.example/${source.kind}`; });
   assert(body.input_references);
   assert.deepEqual(body.input_references.map(reference => reference.type), ['image_url', 'audio_url', 'video_url']);
-  assert.equal((body.input_references[1].audio_url as { url: string }).url, `data:audio/example;base64,${Buffer.from('asset bytes').toString('base64')}`);
+  assert.equal((body.input_references[0].image_url as { url: string }).url, `data:image/example;base64,${Buffer.from('asset bytes').toString('base64')}`);
+  assert.equal((body.input_references[1].audio_url as { url: string }).url, 'https://references.example/audio');
+  assert.equal((body.input_references[2].video_url as { url: string }).url, 'https://references.example/video');
+  assert.equal(published.length, 2);
+  await assert.rejects(buildRequest({ ...input, assets: [{ id: 'video', role: 'reference' }] }, assets, store.uploads), /HTTPS hosting/);
+});
+
+test('video references use HTTPS snapshots, survive library deletion, and are revoked after completion', async () => {
+  nextStatus = 'pending';
+  const agent = request.agent(studio.app);
+  await agent.post('/api/connection').send({ key: 'valid-test-key' });
+  const video = Buffer.from('000000186674797069736f6d0000020069736f6d6d703432', 'hex');
+  const asset = (await agent.post('/api/assets').attach('files', video, 'reference.mp4').expect(201)).body.assets[0];
+  const result = await agent.post('/api/jobs').send({ ...input, assets: [{ id: asset.id, role: 'reference' }] }).expect(202);
+  const url = (lastSubmission.input_references as { video_url: { url: string } }[])[0].video_url.url;
+  assert.match(url, /^https:\/\/references\.example\/_frame_references\/[a-f0-9]{64}\/input.mp4$/);
+  const path = new URL(url).pathname;
+  await request(studio.app).get(path).expect(200);
+  await request(studio.app).get(path).set('Range', 'bytes=0-5').expect(206);
+  await agent.delete(`/api/assets/${asset.id}`).expect(204);
+  await request(studio.app).get(path).expect(200);
+  nextStatus = 'completed'; await waitForStatus(agent, result.body.job.id, 'completed');
+  await request(studio.app).get(path).expect(404);
 });
 
 test('cross-origin writes, malformed JSON, and unknown routes fail cleanly', async () => {

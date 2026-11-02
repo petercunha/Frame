@@ -12,16 +12,20 @@ import { OpenRouter, ApiError, type UpstreamJob } from './openrouter';
 import { generationSchema, validateGeneration, buildRequest, referenceFile } from './generation';
 import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, terminalStatuses, type AssetKind } from '../shared/types';
 import { editsSchema, MediaService } from './media';
+import { REFERENCE_PATH, ReferenceHost, type ReferencePublisher } from './reference-host';
+import { promptRoutes } from './prompts';
 
 declare global { namespace Express { interface Request { studioOwner: string } } }
 
-interface AppOptions { store: Store; router?: OpenRouter; apiKey?: string; pollInterval?: number; maxUploadBytes?: number }
+interface AppOptions { store: Store; router?: OpenRouter; apiKey?: string; pollInterval?: number; maxUploadBytes?: number; references?: ReferencePublisher }
 
-export function createApp({ store, router = new OpenRouter(), apiKey, pollInterval = 5000, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES }: AppOptions) {
+export function createApp({ store, router = new OpenRouter(), apiKey, pollInterval = 5000, maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES, references = new ReferenceHost(resolve(store.directory, 'reference-exports'), { publicOrigin: process.env.REFERENCE_PUBLIC_ORIGIN }) }: AppOptions) {
   const app = express();
   const keys = new Map<string, { value: string; touched: number }>();
   const polls = new Map<string, ReturnType<typeof setTimeout>>();
   const media = new MediaService(store);
+  const jobReferences = new Map<string, string[]>();
+  app.use(REFERENCE_PATH, references.router);
   const polling = new Set<string>();
   let closed = false;
   const keyFor = (owner: string) => {
@@ -52,6 +56,7 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     next();
   });
   app.use(express.json({ limit: '256kb' }));
+  app.use('/api/prompts', promptRoutes(store));
 
   function applyJob(job: StoredJob, upstream: UpstreamJob) {
     job.status = upstream.status;
@@ -70,8 +75,10 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
       polling.add(job.id);
       let nextFailures = 0;
       try {
+        references.renew(jobReferences.get(job.id) ?? []);
         applyJob(job, await router.poll(key, job.upstreamId));
         await store.save();
+        if (terminalStatuses.includes(job.status)) { await references.release(jobReferences.get(job.id) ?? []); jobReferences.delete(job.id); }
       } catch (error) {
         nextFailures = failures + 1;
         job.pollError = error instanceof Error ? error.message : 'Status check failed. Retrying.';
@@ -197,6 +204,8 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     if (submitting.has(req.studioOwner)) throw new ApiError(429, 'A generation is already being submitted. Please wait.');
     if (store.data.jobs.filter(j => j.owner === req.studioOwner && !terminalStatuses.includes(j.status)).length >= 3) throw new ApiError(429, 'You can run up to three generations at once. Wait for one to finish.');
     submitting.add(req.studioOwner);
+    const referenceIds: string[] = [];
+    let accepted = false;
     try {
       const model = (await router.models()).find(m => m.id === input.model);
       if (!model) throw new ApiError(400, 'That model is no longer available. Choose another model.');
@@ -214,15 +223,21 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
         return bytes + file.size;
       }, 0);
       if (total > 50 * 1024 * 1024) throw new ApiError(413, 'Use at most 50 MB of references per generation.');
-      const upstream = await router.submit(key, await buildRequest(input, assets, store.uploads));
+      const body = await buildRequest(input, assets, store.uploads, store.prepared, async source => {
+        const reference = await references.publish(source); referenceIds.push(reference.id); return reference.url;
+      });
+      const upstream = await router.submit(key, body);
       const now = new Date().toISOString();
       const job: StoredJob = { id: randomUUID(), upstreamId: upstream.id, owner: req.studioOwner, title: input.prompt.slice(0, 80) || 'Image to video', status: upstream.status, input, createdAt: now, updatedAt: now, outputCount: 0 };
       applyJob(job, upstream);
       store.data.jobs.push(job);
+      jobReferences.set(job.id, referenceIds);
+      accepted = true;
       await store.save();
+      if (terminalStatuses.includes(job.status)) { await references.release(referenceIds); jobReferences.delete(job.id); }
       schedule(job);
       res.status(202).json({ job: publicJob(job) });
-    } finally { submitting.delete(req.studioOwner); }
+    } finally { if (!accepted) await references.release(referenceIds); submitting.delete(req.studioOwner); }
   });
   app.get('/api/jobs/:id/content', async (req, res) => {
     const job = findJob(String(req.params.id), req.studioOwner);
@@ -261,5 +276,5 @@ export function createApp({ store, router = new OpenRouter(), apiKey, pollInterv
     res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
   };
   app.use(errorHandler);
-  return { app, close: () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); keys.clear(); } };
+  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); keys.clear(); await references.close(); } };
 }

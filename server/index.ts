@@ -23,4 +23,4 @@ const host = process.env.HOST || '127.0.0.1';
 const server = app.listen(port, host, () => console.log(`\n  Frame Video Studio\n  Local: http://${host}:${port}\n`));
 // Large originals stream directly to disk and can take longer than Node's default request timeout.
 server.requestTimeout = 0;
-for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => { close(); server.close(() => process.exit(0)); });
+for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, async () => { await close(); server.close(() => process.exit(0)); });

@@ -15,6 +15,7 @@
     "test": "tsx --test server/*.test.ts"
   },
   "dependencies": {
+    "cloudflared": "^0.7.3",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "file-type": "^21.0.0",

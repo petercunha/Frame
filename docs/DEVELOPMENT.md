@@ -35,6 +35,8 @@ MAX_UPLOAD_MB=10240
 - **DATA_DIR** controls where uploads and history are stored. Keep it on persistent storage if you run a long-lived server.
 - **MAX_UPLOAD_MB** sets the per-original upload limit in MB (default 10240, or 10 GB). This is independent of the 25 MB per-input and 50 MB per-generation limits. Originals stream to disk, with browser upload progress.
 - **FFMPEG_PATH / FFPROBE_PATH** optionally select executable paths when the tools are not on PATH. Commands are spawned using argument arrays, never a shell.
+- **REFERENCE_PUBLIC_ORIGIN** optionally sets a stable public HTTPS origin (for example `https://frame.example.com`) that routes `/_frame_references/*` to this app. It must be an origin without a path, query, or credentials. Local installs leave this unset and use an isolated Cloudflare Quick Tunnel.
+- **CLOUDFLARED_BIN** optionally selects an existing `cloudflared` executable. Otherwise the npm dependency supplies/downloads the helper on demand. No Cloudflare account is needed for local Quick Tunnels.
 
 Keys entered through the interface live only in server memory. They expire after 24 hours without use; active polling counts as use. A server restart clears those session keys. An environment key remains available from the environment.
 
@@ -50,6 +52,8 @@ server/openrouter.ts OpenRouter client and model metadata parsing
 server/store.ts     Serialized, atomic JSON persistence
 server/media.ts     Media inspection, edit validation, and queued Sharp/FFmpeg preparation
 server/media.test.ts Real media processing and original-preservation tests
+server/reference-host.ts Temporary HTTPS links and isolated file-only tunnel
+server/prompts.ts    Saved prompts, immutable revisions, and restoration
 server/index.ts     Development and production server entry point
 server/app.test.ts  Integration and validation tests
 shared/types.ts     Shared data types and conservative cost estimates
@@ -62,7 +66,7 @@ data/               Runtime files; created automatically and ignored by Git
 
 1. Read the live catalog from `GET /api/v1/videos/models` (cached for five minutes).
 2. Validate the requested settings against the selected model’s capabilities.
-3. Resolve each selected asset to an immutable prepared version, or its original if unedited, and validate input size before reading it into memory. Encode those bytes as data URLs. Frame images use `frame_images`; image, audio, and video references use `input_references` with the documented type for each asset.
+3. Resolve each selected asset to an immutable prepared version, or its original if unedited, and validate input size. Images and frame images use data URLs. Audio/video inputs use fetchable HTTPS links; their URL fields must never contain base64 data URLs. Reference images/audio/video use their documented `input_references` discriminated types.
 4. Submit one request to `POST /api/v1/videos`. Submission is never automatically retried, avoiding accidental duplicate charges.
 5. Save the job ID and settings locally; poll every five seconds with exponential backoff for transient failures.
 6. Stop on `completed`, `failed`, `cancelled`, or `expired`. Keep terminal errors, output count, and reported USD cost in history.
@@ -91,6 +95,9 @@ All paths below start with `/api`. Browser session cookies are HttpOnly and Same
 | `/assets/:id/prepare` | POST | Validate edits and enqueue a separate prepared input |
 | `/assets/:id/prepared` | DELETE | Restore original input without deleting saved versions |
 | `/assets/:id/prepared/:versionId/content` | GET | Stream an owned prepared version, with range support |
+| `/prompts` | GET, POST | List or create owned saved prompts |
+| `/prompts/:id` | GET, PUT, DELETE | Inspect history, save a new revision, or delete an owned prompt |
+| `/prompts/:id/restore` | POST | Restore an older revision as a new version |
 | `/jobs` | GET, POST | List or submit owned generations |
 | `/jobs/:id` | DELETE | Remove a terminal generation from local history |
 | `/jobs/:id/content` | GET | Stream an output; `index=N` selects a clip, `download=1` downloads it |
@@ -124,9 +131,25 @@ Omit crop and size controls for audio, and time controls for images. Limits and 
 
 Local data and keys are excluded from the initial Git repository. Back up `data/` if you want to retain uploads and job history. Generated media is streamed from OpenRouter rather than archived automatically on disk.
 
+## HTTPS references for local installations
+
+OpenRouter’s video endpoint rejects base64 `video_url.url` values. `ReferenceHost` publishes only selected audio/video input files using random 256-bit token links under `/_frame_references/:token/input.ext`. It snapshots the chosen bytes into `data/reference-exports/`, so deletion or editing of the original cannot break a pending generation. Images continue to use the supported inline data URLs.
+
+For local use, a loopback sidecar serves only those token-protected files. A lazy `cloudflared` Quick Tunnel connects to that sidecar, never to the studio’s HTTP port. It cannot serve app pages, cookies, keys, APIs, or arbitrary library paths. The tunnel waits for a connection and public DNS propagation before returning URLs. This avoids caching an early NXDOMAIN for a new hostname. The helper is downloaded from the official Cloudflare release location through the `cloudflared` dependency when absent.
+
+Input links carry no cookies or API keys, support GET/HEAD/ranges, and return `Cache-Control: private, no-store`. Pending job polling renews their two-hour lifetime. Terminal job states and rejected submissions revoke links and remove snapshots. Expired links stop serving immediately, and the cleanup sweep removes snapshots. An idle local tunnel stops after a minute. Restarting Frame ends the in-memory grants and the local tunnel; keep the server running until reference-based jobs finish.
+
+Quick Tunnels are intended for local development, with changing hostnames and no uptime guarantee. Hosted production installs should set `REFERENCE_PUBLIC_ORIGIN` to their own stable HTTPS origin and route the reference path to this app. Protect the rest of the app using the deployment’s usual sign-in. Never proxy the entire local studio through the automatic tunnel.
+
+## Saved prompts and version history
+
+The JSON store now includes an owned `prompts` collection; older workspaces migrate with an empty collection. Each saved prompt has a stable ID, title, current text, version, and timestamps, plus an immutable revision list. An unchanged save is a no-op. Text/name changes append a revision.
+
+Updates require `expectedVersion`; stale updates return 409 without modifying history. Restoring an earlier revision appends a new one with `restoredFrom`, preserving every intervening version. Prompt list responses include the current text only; the owned detail endpoint supplies history. Deletion removes the prompt and its history after the UI’s inline confirmation. A browser session cannot read, modify, restore, or delete another session’s prompts.
+
 ## Verification
 
-The integration suite covers key validation, upload signature checks and session isolation, model discovery, asynchronous state transitions, provider failures, retry behavior, reference serialization, request validation, cost units, and ranged video downloads. Real media fixtures verify cropping location, resizing, trimming, audio removal, EXIF/video orientation, prepared version stability, restart recovery, failed preparations, large-original upload handling, and byte-for-byte original preservation. Browser checks cover desktop/mobile editors, draggable crops, time selection, and prepared image/video/audio playback. A paid live generation requires your own key and is not part of automated tests.
+The integration suite covers key validation, upload signature checks and session isolation, model discovery, asynchronous state transitions, provider failures, retry behavior, HTTPS reference payloads, token expiry/revocation and snapshot isolation, saved prompt revisions/restoration/concurrency, cost units, and ranged video downloads. Real media fixtures verify cropping location, resizing, trimming, audio removal, EXIF/video orientation, prepared version stability, restart recovery, failed preparations, large-original upload handling, and byte-for-byte original preservation. Browser checks cover desktop/mobile editors, prompt saving and rollback, and prepared image/video/audio playback. A separate live tunnel smoke check uses a synthetic clip to verify public HTTPS range downloads and isolation from the studio API; it never calls a paid model. A paid live generation requires your own key and is not part of automated tests.
 
 ## API references
 
@@ -134,5 +157,6 @@ The integration suite covers key validation, upload signature checks and session
 - [Video model discovery](https://openrouter.ai/api/v1/videos/models)
 - [Canonical OpenAPI schema](https://openrouter.ai/openapi.json) — includes the image, audio, and video reference union.
 - [Wan 3.0 model documentation](https://openrouter.ai/alibaba/wan-3.0/llms.txt)
+- [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
 
 The catalog and API schema were checked during implementation. Models, rates, and provider-specific restrictions can change; the running application discovers current options rather than hardcoding the model list.

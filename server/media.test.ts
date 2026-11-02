@@ -38,7 +38,7 @@ before(async () => {
   };
   studio = createApp({ store, router: new OpenRouter('https://test.invalid', fetcher), apiKey: 'local-test-only' });
 });
-after(async () => { studio.close(); await rm(directory, { recursive: true, force: true }); });
+after(async () => { await studio.close(); await rm(directory, { recursive: true, force: true }); });
 
 test('image preparation crops the selected pixels, downsizes, and preserves the original byte for byte', async () => {
   const agent = request.agent(studio.app);

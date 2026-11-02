@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
-import { ArrowDownToLine, ArrowRight, AudioLines, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
-import type { Asset, AssetRole, Connection, GenerationInput, VideoJob, VideoModel } from '../shared/types';
+import { ArrowDownToLine, ArrowRight, AudioLines, Bookmark, Check, ChevronDown, ChevronRight, Clapperboard, Clock3, ExternalLink, Film, FolderOpen, Grid2X2, ImagePlus, Images, KeyRound, Layers3, LoaderCircle, Menu, Monitor, Pencil, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload, WandSparkles, X } from 'lucide-react';
+import type { Asset, AssetRole, Connection, GenerationInput, SavedPrompt, VideoJob, VideoModel } from '../shared/types';
 import { DEFAULT_MAX_UPLOAD_BYTES, MAX_REFERENCE_BYTES, estimateCost, terminalStatuses } from '../shared/types';
 import Modal from './components/Modal';
 import { api, uploadAssets } from './api';
 import AssetEditor from './components/AssetEditor';
 import { formatBytes, inputSummary, isPreparing } from './media';
+import { SavePrompt, SavedPrompts } from './components/SavedPrompts';
 
 type View = 'studio' | 'library' | 'assets' | 'inspiration';
 type Selection = GenerationInput['assets'][number];
@@ -30,6 +31,8 @@ export default function App() {
   const [connectionLoaded, setConnectionLoaded] = useState(false);
   const [modelId, setModelId] = useState('alibaba/wan-3.0');
   const [prompt, setPrompt] = useState(() => { try { return localStorage.getItem('frame.prompt') || ''; } catch { return ''; } });
+  const [activeSavedPrompt, setActiveSavedPrompt] = useState<SavedPrompt | null>(null);
+  const [promptToSave, setPromptToSave] = useState<{ text: string; saved?: SavedPrompt | null; fromComposer: boolean } | null>(null);
   const [duration, setDuration] = useState(5);
   const [resolution, setResolution] = useState('720p');
   const [ratio, setRatio] = useState('16:9');
@@ -53,7 +56,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [formError, setFormError] = useState('');
   const [toast, setToast] = useState('');
-  const [modal, setModal] = useState<'settings' | 'models' | 'assets' | null>(null);
+  const [modal, setModal] = useState<'settings' | 'models' | 'assets' | 'prompts' | null>(null);
   const [modelSearch, setModelSearch] = useState('');
   const [librarySearch, setLibrarySearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
@@ -190,11 +193,12 @@ export default function App() {
     finally { setConnecting(false); }
   }
   function reuse(job: VideoJob) {
+    setActiveSavedPrompt(null);
     setModelId(job.input.model); setPrompt(job.input.prompt); setDuration(job.input.duration ?? 5); setResolution(job.input.resolution ?? ''); setRatio(job.input.aspect_ratio ?? '');
     // Model controls reset on model change; missing/deleted references are not silently reused.
     setSelections([]); setMode('text'); setView('studio'); setToast('Prompt and output settings copied. Reattach any references before generating.');
   }
-  function useInspiration(index: number) { setPrompt(inspiration[index].prompt); navigate('studio'); setTimeout(() => promptRef.current?.focus(), 0); }
+  function useInspiration(index: number) { setActiveSavedPrompt(null); setPrompt(inspiration[index].prompt); navigate('studio'); setTimeout(() => promptRef.current?.focus(), 0); }
   function onDrop(event: DragEvent) { event.preventDefault(); setDragging(false); void uploadFiles(Array.from(event.dataTransfer.files)); }
 
   const assetThumb = (asset: Asset, large = false) => asset.kind === 'image' ? <img src={asset.prepared?.url ?? asset.url} alt={asset.name} loading="lazy" /> : asset.kind === 'video' ? <Film size={large ? 36 : 20} /> : <AudioLines size={large ? 36 : 20} />;
@@ -218,11 +222,12 @@ export default function App() {
     <aside className={`sidebar ${mobileNav ? 'is-open' : ''}`}>
       <a href="#" className="brand" onClick={e => { e.preventDefault(); navigate('studio'); }} aria-label="Frame home"><span className="brand-mark"><span /><span /><span /></span><span>frame<span className="brand-period">.</span></span></a>
       <div className="workspace-picker"><span className="workspace-avatar">S</span><div><strong>My workspace</strong><span>Personal studio</span></div><Layers3 size={15} /></div>
-      <button className="new-video" onClick={() => { navigate('studio'); setPrompt(''); setSelections([]); setActiveJobId(null); setFormError(''); setMode('text'); }}><Plus size={17} /> New video <span>↗</span></button>
+      <button className="new-video" onClick={() => { navigate('studio'); setPrompt(''); setActiveSavedPrompt(null); setSelections([]); setActiveJobId(null); setFormError(''); setMode('text'); }}><Plus size={17} /> New video <span>↗</span></button>
       <div className="nav-label">WORKSPACE</div>
       <nav aria-label="Main navigation">
         <button className={view === 'studio' ? 'active' : ''} onClick={() => navigate('studio')}><Clapperboard size={18} /> Video studio <span className="nav-dot" /></button>
         <button className={view === 'library' ? 'active' : ''} onClick={() => navigate('library')}><Grid2X2 size={18} /> My creations <span className="nav-count">{jobs.length}</span></button>
+        <button onClick={() => { setMobileNav(false); setModal('prompts'); }}><Bookmark size={18} /> Saved prompts</button>
         <button className={view === 'assets' ? 'active' : ''} onClick={() => navigate('assets')}><FolderOpen size={18} /> Asset library <span className="nav-count">{assets.length}</span></button>
         <div className="nav-divider" />
         <button className={view === 'inspiration' ? 'active' : ''} onClick={() => navigate('inspiration')}><Sparkles size={18} /> Inspiration <span className="new-badge">NEW</span></button>
@@ -245,7 +250,7 @@ export default function App() {
             <section className="composer card" aria-label="Video generation settings">
               <div className="card-topline"><div className="section-title"><WandSparkles size={18} /><h2>Create a video</h2></div><span className="subtle-label">LET’S MAKE SOMETHING</span></div>
               <div className="mode-tabs" aria-label="Generation mode">{(['text', 'image', 'reference'] as const).map(item => <button key={item} className={mode === item ? 'selected' : ''} onClick={() => changeMode(item)}>{item === 'text' ? <Film size={14} /> : item === 'image' ? <ImagePlus size={14} /> : <Images size={14} />}{item === 'text' ? 'Text to video' : item === 'image' ? 'Image to video' : 'References'}</button>)}</div>
-              <div className="field-label"><label htmlFor="prompt">Your prompt</label><span>The more detail, the more possibility.</span></div>
+              <div className="field-label"><label htmlFor="prompt">Your prompt</label><div className="prompt-inline-actions"><button className="text-button" disabled={!prompt.trim()} onClick={() => setPromptToSave({ text: prompt, saved: activeSavedPrompt, fromComposer: true })}><Bookmark size={11} />{activeSavedPrompt ? 'Save revision' : 'Save prompt'}</button><button className="text-button" onClick={() => setModal('prompts')}>Saved prompts <ChevronRight size={11} /></button></div></div>
               <div className="prompt-box"><textarea ref={promptRef} id="prompt" placeholder={'Imagine a scene. A place, a feeling, a story…\n\nDescribe what you want to see, how it moves, and what makes it yours.'} maxLength={10000} value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); if (!submitting && !uploading) void generate(); } }} /><div className="prompt-footer"><span><Sparkles size={12} /> A little detail makes a big difference</span><span>{prompt.length.toLocaleString()} / 10,000</span></div></div>
               <div className="field-label assets-label"><span>{mode === 'image' ? 'Frame images' : 'Reference assets'} <span className="optional">Optional</span></span><button className="text-button" onClick={() => setModal('assets')}>From library <ChevronRight size={12} /></button></div>
               {mode === 'image' ? <div className="frame-slots">{(['first_frame', 'last_frame'] as const).filter(role => model?.supported_frame_images?.includes(role)).map(role => {
@@ -279,7 +284,7 @@ export default function App() {
                 {!!Object.keys(model?.pricing_skus || {}).length && <details className="pricing-details"><summary>Model pricing</summary>{Object.entries(model!.pricing_skus).map(([key, value]) => <div key={key}><span>{key.replaceAll('_', ' ')}</span><code>{value}</code></div>)}<p className="hint">SKU units vary. Your actual charge appears after generation.</p></details>}
               </div>}
               {formError && <div className="form-error" role="alert">{formError}</div>}
-              <div className="generate-section"><button className="generate-button" disabled={submitting || uploading || !model || activeCount >= 3 || selectedPreparing} onClick={() => void generate()}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}<span>{submitting ? 'Submitting your vision…' : activeCount >= 3 ? '3 generations running' : selectedPreparing ? 'Preparing reference assets…' : oversizedInput ? 'Prepare reference input' : 'Generate video'}</span><ArrowRight size={17} /></button><div className="generation-footnote"><span>{cost === null ? 'Priced by your selected provider' : <>Estimated <strong>{money(cost)}</strong> / generation</>}</span><span>⌘ / Ctrl + Enter</span></div></div>
+              <div className="generate-section"><button className="generate-button" disabled={submitting || uploading || !model || activeCount >= 3 || selectedPreparing} onClick={() => void generate()}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}<span>{submitting ? selectedAssets.some(selection => selection.asset?.kind !== 'image') ? 'Preparing & submitting…' : 'Submitting your vision…' : activeCount >= 3 ? '3 generations running' : selectedPreparing ? 'Preparing reference assets…' : oversizedInput ? 'Prepare reference input' : 'Generate video'}</span><ArrowRight size={17} /></button><div className="generation-footnote"><span>{cost === null ? 'Priced by your selected provider' : <>Estimated <strong>{money(cost)}</strong> / generation</>}</span><span>⌘ / Ctrl + Enter</span></div></div>
             </section>
 
             <section className="preview-column" aria-label="Video preview">
@@ -309,6 +314,8 @@ export default function App() {
     </div>
     <input className="sr-only" tabIndex={-1} aria-label="Upload media files" ref={fileRef} type="file" multiple accept="image/*,video/*,audio/*" onChange={e => void uploadFiles(Array.from(e.target.files || []), uploadRole.current)} />
     {editingAsset && <AssetEditor key={editingAsset.id} asset={editingAsset} onUpdate={updated => setAssets(current => current.map(asset => asset.id === updated.id ? updated : asset))} onClose={() => setEditingAssetId(null)} />}
+    {modal === 'prompts' && <SavedPrompts onClose={() => setModal(null)} onUse={saved => { setPrompt(saved.text); setActiveSavedPrompt(saved); setModal(null); navigate('studio'); setToast(`Loaded “${saved.title}” · version ${saved.version}.`); }} onEdit={saved => { setModal(null); setPromptToSave({ text: saved.text, saved, fromComposer: false }); }} onUpdate={saved => { if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); }} onRemove={id => { if (activeSavedPrompt?.id === id) setActiveSavedPrompt(null); }} />}
+    {promptToSave && <SavePrompt text={promptToSave.text} saved={promptToSave.saved} onClose={() => setPromptToSave(null)} onSaved={saved => { if (promptToSave.fromComposer) { setPrompt(saved.text); setActiveSavedPrompt(saved); } else if (activeSavedPrompt?.id === saved.id) setActiveSavedPrompt(saved); setPromptToSave(null); setToast(`Saved “${saved.title}” · version ${saved.version}.`); }} />}
     {toast && <div className="toast" role="status"><Check size={17} /><span>{toast}</span><button className="icon-button small" aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}
 
     {modal === 'settings' && <Modal title="Connect your studio" onClose={() => { setModal(null); setApiKey(''); setConnectionError(''); }}><div className="connection-illustration"><KeyRound size={28} /></div><p className="modal-intro">One key. A world of possibilities.</p><p className="modal-description">Connect OpenRouter to generate with Wan, Seedance, Veo, and other available video models. Generation costs are billed to your OpenRouter account.</p>{connection.connected && <div className="connected-state"><Check size={17} />{connection.source === 'environment' ? 'Using your server’s environment key.' : 'Your studio is connected.'}</div>}<form onSubmit={e => { e.preventDefault(); void connect(); }}><label className="input-label" htmlFor="api-key">OpenRouter API key</label><input autoComplete="off" id="api-key" type="password" placeholder="sk-or-v1-…" value={apiKey} onChange={e => setApiKey(e.target.value)} required minLength={10} /><p className="hint"><ShieldCheck size={12} /> Your key is held in server memory for up to 24 hours of inactivity. It is never saved in browser storage or on disk.</p>{connectionError && <div className="form-error" role="alert">{connectionError}</div>}<button type="submit" className="primary-button full-width" disabled={connecting || apiKey.length < 10}>{connecting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={15} />}{connecting ? 'Checking your key…' : connection.connected ? 'Update API key' : 'Connect OpenRouter'}<ArrowRight size={15} /></button></form><div className="modal-bottom"><a href="https://openrouter.ai/settings/keys" target="_blank" rel="noreferrer">Get an API key <ExternalLink size={12} /></a>{connection.source === 'session' && <button className="text-button danger" onClick={async () => { try { setConnection(await api<Connection>('/connection', { method: 'DELETE' })); setToast('Session key removed.'); } catch (e) { setConnectionError(errorText(e)); } }}>Remove session key</button>}</div></Modal>}

@@ -24,6 +24,7 @@ A calm, creative workspace for turning your words, images, and references into A
 Describe a scene, choose how it should look, and let your selected video model bring it to life. Frame starts with **Wan 3.0** and discovers other available video models directly from OpenRouter, so you can explore different creative engines in one place.
 
 - **Start with words.** Write a prompt or borrow a starting point from the inspiration gallery.
+- **Keep your best prompts.** Name and save a prompt, refine it over time, and restore any earlier version from its history.
 - **Bring your own ingredients.** Drop in photos, video clips, or audio, and reuse them from your asset library.
 - **Keep the original. Edit the input.** Crop images or videos, choose maximum dimensions, and trim footage or sound. Your full-quality originals stay untouched.
 - **Frame the scene.** Use an image to guide the first or last frame on models that support it.
@@ -82,6 +83,14 @@ Have a long 4K recording, but only need five seconds? Upload the original to **A
 Switch to **Prepared input** to see exactly what will be sent to the model. You can close the editor while preparation runs, reopen it to adjust your edits, or choose **Use original input** to undo them. Edit icons are also available on attached references and frame images in the studio.
 
 Your original stays in the library byte for byte. Photos are prepared as PNG, video as MP4, and audio as WAV. Prepared inputs keep their proportions, never upscale the source, and must fit within 25 MB each.
+
+### Save an idea. Keep every version.
+
+Click **Save prompt** above the prompt field and give your idea a name. Find it later in **Saved prompts**, then choose **Use prompt** to load it into the studio. After making changes, choose **Save revision**.
+
+Open a saved prompt’s **History** to compare earlier versions. **Restore this version** makes that version current by adding a new revision; the versions that followed it stay available. **Save as new prompt** lets you branch an idea into a separate saved prompt.
+
+![Frame’s saved prompt history showing preserved revisions and a restore action](docs/screenshots/prompt-history.png)
 
 ### Choose the right model for your idea
 
@@ -149,6 +158,12 @@ Uploads and generation history live in the local `data` folder. Your browser ses
 
 Asset edits create a separate prepared file. The original is never overwritten, and only your prepared input is sent when one is saved. Unedited assets use the original if it fits within the input limits.
 
+Video and audio references need an HTTPS link that OpenRouter can fetch. On a local install, Frame starts a separate, file-only Cloudflare Quick Tunnel when needed. It shares only temporary copies of the selected model inputs through unguessable links, and revokes those links when the generation reaches a final status. Links expire after two hours unless an active job renews them. Your studio, API key, and other library files are not served through that tunnel. Cloudflare carries the reference transfer; OpenRouter and the provider receive the selected input.
+
+The first video/audio reference may take a little longer while HTTPS sharing starts. The `cloudflared` helper is installed automatically by the dependency or on first use. Hosted installations can configure their own stable HTTPS origin instead.
+
+Saved prompts and their version histories are stored locally with your workspace. They survive server restarts; reopen the studio in the same browser to find them.
+
 Generated videos are fetched from OpenRouter. Download the clips you want to keep, since availability depends on the service’s retention period.
 
 </details>
@@ -157,6 +172,8 @@ Generated videos are fetched from OpenRouter. Download the clips you want to kee
 <summary><strong>Can I close the browser while a video is generating?</strong></summary>
 
 Yes, as long as the Node.js server stays running. It keeps checking active jobs in the background. If you restart the server, reconnect your key and open the studio to resume status checks. Closing the browser does not cancel a submitted generation.
+
+For video/audio references, keep Frame running until the job finishes: the provider may still need to fetch the temporary input link. Restarting Frame ends local tunnel links.
 
 </details>
 
