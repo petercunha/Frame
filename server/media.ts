@@ -32,7 +32,7 @@ export function validateEdits(edits: AssetEdits, asset: StoredAsset) {
 }
 
 interface CommandOptions { signal?: AbortSignal; progress?: (seconds: number) => void; timeout?: number }
-async function command(binary: string, args: string[], options: CommandOptions = {}) {
+export async function runMediaCommand(binary: string, args: string[], options: CommandOptions = {}) {
   return new Promise<string>((resolvePromise, reject) => {
     const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
@@ -83,7 +83,7 @@ export async function inspectMedia(path: string, kind: StoredAsset['kind']): Pro
       return { width: rotated ? metadata.height : metadata.width, height: rotated ? metadata.width : metadata.height, animated: (metadata.pages ?? 1) > 1 };
     } catch { throw new ApiError(422, 'This image could not be opened. Try another image format.'); }
   }
-  const output = await command(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-show_entries', 'stream=codec_type,width,height,duration,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation:format=duration', '-of', 'json', path], { timeout: 30_000 });
+  const output = await runMediaCommand(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-show_entries', 'stream=codec_type,width,height,duration,sample_aspect_ratio:stream_tags=rotate:stream_side_data=rotation:format=duration', '-of', 'json', path], { timeout: 30_000 });
   const probe = JSON.parse(output);
   const streams = probe.streams ?? [];
   const video = streams.find((stream: { codec_type: string }) => stream.codec_type === 'video');
@@ -179,7 +179,7 @@ export class MediaService {
           args.push('-movflags', '+faststart');
         } else args.push('-map', '0:a:0', '-vn', '-c:a', 'pcm_s16le');
         args.push('-map_metadata', '-1', '-progress', 'pipe:1', '-nostats', output);
-        await command(process.env.FFMPEG_PATH || 'ffmpeg', args, { signal: controller.signal, progress: seconds => {
+        await runMediaCommand(process.env.FFMPEG_PATH || 'ffmpeg', args, { signal: controller.signal, progress: seconds => {
           if (asset.preparation?.id === id && Number.isFinite(seconds)) asset.preparation.progress = Math.min(0.98, Math.max(0, seconds / duration));
         } });
       }

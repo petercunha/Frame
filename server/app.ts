@@ -16,6 +16,7 @@ import { REFERENCE_PATH, ReferenceHost, type ReferencePublisher } from './refere
 import { promptRoutes } from './prompts';
 import { OutputArchive } from './outputs';
 import { captureJobReferences, reusableJob } from './job-references';
+import { SilentDownloads } from './silent-downloads';
 
 declare global { namespace Express { interface Request { studioOwner: string } } }
 
@@ -28,6 +29,7 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
   const connections = store.connections;
   const polls = new Map<string, ReturnType<typeof setTimeout>>();
   const media = new MediaService(store);
+  const silentDownloads = new SilentDownloads(resolve(store.outputs, 'without-audio'));
   const jobReferences = new Map<string, string[]>();
   app.use(REFERENCE_PATH, references.router);
   const polling = new Set<string>();
@@ -128,6 +130,14 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
   }
   // Backfill existing completed generations and resume interrupted local saves.
   store.data.jobs.filter(job => job.status === 'completed').forEach(job => archive.schedule(job));
+  async function localClip(job: StoredJob, index: number) {
+    const path = archive.path(job, index);
+    const file = await stat(path).catch(() => null);
+    const output = job.outputs?.find(output => output.index === index);
+    if (!file?.isFile() || !file.size || (output && file.size !== output.size)) await archive.ensure(job);
+    if (!store.data.jobs.includes(job)) throw new ApiError(404, 'Generation not found.');
+    return { path, mime: job.outputs?.find(output => output.index === index)?.mime ?? 'video/mp4' };
+  }
 
   app.get('/api/health', (_req, res) => { res.json({ ok: true }); });
   app.get('/api/config', (_req, res) => { res.json({ maxUploadBytes }); });
@@ -302,22 +312,34 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
     void archive.ensure(job).catch(() => {});
     res.status(202).json({ job: publicJob(job) });
   });
+  app.post('/api/jobs/:id/without-audio', async (req, res) => {
+    const job = findJob(String(req.params.id), req.studioOwner);
+    if (job.status !== 'completed') throw new ApiError(409, 'This video is not ready yet.');
+    const { index } = z.object({ index: z.number().int().min(0).max(job.outputCount - 1).default(0) }).parse(req.body ?? {});
+    const source = await localClip(job, index);
+    await silentDownloads.prepare(job.id, index, source.path, source.mime);
+    res.json({ url: `/api/jobs/${job.id}/content?index=${index}&download=1&audio=0` });
+  });
   app.get('/api/jobs/:id/content', async (req, res) => {
     const job = findJob(String(req.params.id), req.studioOwner);
     if (job.status !== 'completed') throw new ApiError(409, 'This video is not ready yet.');
     const index = z.coerce.number().int().min(0).max(job.outputCount - 1).parse(req.query.index ?? 0);
-    const path = archive.path(job, index);
-    const file = await stat(path).catch(() => null);
-    const output = job.outputs?.find(output => output.index === index);
-    if (!file?.isFile() || !file.size || (output && file.size !== output.size)) await archive.ensure(job);
+    const source = await localClip(job, index);
+    if (req.query.audio === '0') {
+      const video = await silentDownloads.prepare(job.id, index, source.path, source.mime);
+      res.attachment(`frame-${job.id.slice(0, 8)}-${index + 1}-without-audio.${video.extension}`);
+      res.type(video.mime).sendFile(video.path, { dotfiles: 'allow' });
+      return;
+    }
     if (req.query.download === '1') res.attachment(`frame-${job.id.slice(0, 8)}-${index + 1}.mp4`);
-    res.type(job.outputs?.find(output => output.index === index)?.mime ?? 'video/mp4').sendFile(path, { dotfiles: 'allow' });
+    res.type(source.mime).sendFile(source.path, { dotfiles: 'allow' });
   });
   app.delete('/api/jobs/:id', async (req, res) => {
     const job = findJob(String(req.params.id), req.studioOwner);
     if (!terminalStatuses.includes(job.status)) throw new ApiError(409, 'Wait until this generation finishes before removing it.');
     store.data.jobs = store.data.jobs.filter(j => j !== job);
     await store.save();
+    await silentDownloads.remove(job.id);
     await archive.remove(job);
     res.status(204).end();
   });
@@ -336,5 +358,5 @@ export function createApp({ store, router = new OpenRouter(), wan = new Wan(), a
     res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
   };
   app.use(errorHandler);
-  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); await archive.close(); await references.close(); } };
+  return { app, close: async () => { closed = true; media.close(); polls.forEach(clearTimeout); polls.clear(); await silentDownloads.close(); await archive.close(); await references.close(); } };
 }

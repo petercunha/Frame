@@ -1,7 +1,9 @@
 import { ArrowDownToLine, RefreshCw } from 'lucide-react';
+import { useState } from 'react';
 import { providerNames, type VideoJob } from '../../shared/types';
 import { inputSummary } from '../media';
 import Modal from './Modal';
+import DownloadWithoutAudio from './DownloadWithoutAudio';
 import './generation-details.css';
 
 export const formatPrice = (cost: number) => `$${cost.toFixed(cost < 0.01 ? 4 : 2)}`;
@@ -28,6 +30,7 @@ export function GenerationFacts({ job }: { job: VideoJob }) {
   </dl>;
 }
 export default function GenerationDetails({ job, onClose, onReuse, onRetry }: { job: VideoJob; onClose: () => void; onReuse: () => void; onRetry: () => void }) {
+  const [clipIndex, setClipIndex] = useState(0);
   const date = (value?: string) => value ? new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Not recorded';
   return <Modal title="Generation details" onClose={onClose} wide className="generation-details">
     <p className="modal-description">{job.modelName || job.input.model} · {providerNames[job.apiProvider ?? 'openrouter']}</p>
@@ -52,6 +55,7 @@ export default function GenerationDetails({ job, onClose, onReuse, onRetry }: { 
     {job.input.provider && <details className="generation-extra"><summary>Provider options</summary><pre>{JSON.stringify(job.input.provider, null, 2)}</pre></details>}
     <StorageStatus job={job} onRetry={onRetry} />
     {job.storage?.error && <p className="hint">{job.storage.error}</p>}
-    <div className="generation-detail-actions"><button className="secondary-button" onClick={onReuse}><RefreshCw size={14} /> Reuse prompt</button>{job.status === 'completed' && <a className="primary-button" href={`/api/jobs/${job.id}/content?download=1`} download><ArrowDownToLine size={14} /> Download video</a>}</div>
+    {job.status === 'completed' && job.outputCount > 1 && <label className="clip-select">Output clip<select value={clipIndex} onChange={event => setClipIndex(Number(event.target.value))}>{Array.from({ length: job.outputCount }, (_, index) => <option key={index} value={index}>Clip {index + 1}</option>)}</select></label>}
+    <div className="generation-detail-actions"><button className="secondary-button" onClick={onReuse}><RefreshCw size={14} /> Reuse prompt</button>{job.status === 'completed' && <><a className="primary-button" href={`/api/jobs/${job.id}/content?index=${clipIndex}&download=1`} download><ArrowDownToLine size={14} /> Download video</a><DownloadWithoutAudio jobId={job.id} index={clipIndex} /></>}</div>
   </Modal>;
 }

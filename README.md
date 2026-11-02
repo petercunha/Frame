@@ -69,7 +69,7 @@ Open **Connection settings** or click **Connect OpenRouter** in the top-right co
 3. Pick a model and adjust the video settings.
 4. Click **Generate video**. Your progress and finished video appear in Preview.
 
-When it’s ready, click **Download** to keep a copy.
+When it’s ready, click **Download** to keep a copy. Choose **Download without audio** to save a silent version with the same video quality; the original keeps its audio. This option is available in Preview and the generation’s **Details**, and uses FFmpeg locally.
 
 > **Your first prompt:** “A slow camera push through a quiet forest at sunrise. Warm light filters through the trees, mist drifts over the path, and leaves move gently in the breeze.”
 
@@ -171,7 +171,7 @@ The first reference that needs HTTPS hosting may take a little longer while HTTP
 
 Saved prompts and their version histories are stored locally with your workspace. They survive server restarts; reopen the studio in the same browser to find them.
 
-Completed videos download automatically into `data/outputs/` (or your configured `DATA_DIR`). Once **Saved on this computer** appears, playback and downloads use that local copy and work without the provider or an API key. Partial saves retry automatically without creating another paid generation. Older completed jobs are also saved when their outputs are still available from the provider; expired outputs cannot be recovered. Removing a generation deletes its local video copies. Back up the data folder to keep your library safe.
+Completed videos download automatically into `data/outputs/` (or your configured `DATA_DIR`). Once **Saved on this computer** appears, playback and downloads use that local copy and work without the provider or an API key. Partial saves retry automatically without creating another paid generation. Older completed jobs are also saved when their outputs are still available from the provider; expired outputs cannot be recovered. Silent downloads are cached separately, so they are ready again next time. In generations with several outputs, choose the clip first. Removing a generation deletes its original and silent local video copies. Back up the data folder to keep your library safe.
 
 Each generation keeps its prompt, settings, model name, reported price, elapsed generation time, and snapshots of the reference input versions it used. **Details** shows this history. **Reuse prompt** restores available references with their original edits, plus duration, resolution, aspect ratio, audio, seed, and provider settings. Deleted or missing references are skipped with a notice. Prices the provider does not report appear as **Not reported**; estimates are kept separately. Generation time includes queueing and is measured when Frame observes completion.
 

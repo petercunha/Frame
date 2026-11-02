@@ -55,6 +55,7 @@ server/connections.ts Private persisted provider keys and workspace mode
 server/store.ts     Serialized, atomic JSON persistence
 server/outputs.ts   Streaming output archive, recovery, and download retries
 server/job-references.ts Exact reference snapshots and available-input reuse
+server/silent-downloads.ts Cached, lossless video exports without audio
 client/completion-sound.ts Gesture-unlocked completion bell and mute preference
 server/media.ts     Media inspection, edit validation, and queued Sharp/FFmpeg preparation
 server/media.test.ts Real media processing and original-preservation tests
@@ -111,7 +112,8 @@ All paths below start with `/api`. Browser session cookies are HttpOnly and Same
 | `/jobs/:id` | DELETE | Remove a terminal generation and its archived video files |
 | `/jobs/:id/reuse` | GET | Return generation settings and exact reference versions still present on disk, plus an unavailable-reference count |
 | `/jobs/:id/archive` | POST | Retry saving the existing completed outputs without submitting a new generation |
-| `/jobs/:id/content` | GET | Stream an output; `index=N` selects a clip, `download=1` downloads it |
+| `/jobs/:id/without-audio` | POST | Prepare a silent download for `{ index: N }` and return its owned download URL |
+| `/jobs/:id/content` | GET | Stream an output; `index=N` selects a clip, `download=1` downloads it; `audio=0` downloads a separate silent copy |
 
 Uploads are checked by file signatures, not just the provided filename. Limits are 12 originals per upload, a configurable 10 GB per original, 25 MB per model input, 50 MB of references per job, and three active generations per browser workspace. The Node server allows long upload requests; production reverse proxies also need suitable body-size and timeout settings. Frame slots are unique; mixing frame images with reference assets is rejected because OpenRouter gives frames precedence. There is no cancellation button because the documented API does not expose a cancellation endpoint.
 
@@ -160,6 +162,14 @@ Reuse resolves owned originals/prepared versions on disk and returns only availa
 
 The completion bell is synthesized with Web Audio, unlocked by user interaction, and plays once on an observed active-to-completed transition. Initial history loads and local-save updates do not play it. A browser-local mute preference is exposed in the top bar. A closed browser cannot play a notification.
 
+## Downloads without audio
+
+Preview and generation Details offer **Download without audio** for any selected output clip. The client first prepares the export through `POST /api/jobs/:id/without-audio`, shows actionable preparation errors, and then downloads it from the existing owned content route with `audio=0`. Files download directly from disk without buffering the whole clip in browser memory.
+
+The server works from the archived original, using FFmpeg with `-map 0:v:0 -c:v copy -an` to remove audio without re-encoding video. Known WebM, Ogg, MOV, and Matroska containers are preserved; other generated clips use MP4. `FFMPEG_PATH` is honored. Source and output paths are generated on the server, arguments bypass the shell, and FFmpeg input protocols are restricted to local file/pipe access.
+
+Silent copies live under `DATA_DIR/outputs/without-audio/<job-id>/`, use owner-only permissions, and are atomically renamed after preparation. A fingerprint of the source file identifies the cached copy; concurrent requests for a clip share one preparation. Originals are not modified. Cached exports survive restarts and need no provider or API key. Job deletion cancels active preparation and removes silent copies as well as originals. Uncached silent downloads require FFmpeg, and missing tools or failed preparation do not affect the original video.
+
 ## HTTPS references for local installations
 
 OpenRouter’s video endpoint rejects base64 `video_url.url` values. `ReferenceHost` publishes selected audio/video inputs for OpenRouter and all media inputs for Wan using random 256-bit token links under `/_frame_references/:token/input.ext`. It snapshots the chosen bytes into `data/reference-exports/`, so deletion or editing of the original cannot break a pending generation. OpenRouter images continue to use inline data URLs. Wan rejects data URLs, so image references and first/last frames use the same HTTPS snapshots. Wan payloads map `aspect_ratio` to `ratio`, `generate_audio` to `audio`, and selected media to `first_frame`, `last_frame`, or `reference_images` / `reference_videos` / `reference_audios`. Before billing, Wan video references are checked for MP4/MOV format, 1–15 seconds each, at most 15 input seconds total, and no more than 30 combined input/output seconds. Wan permits at most 10 image, 5 video, and 5 audio references, within Frame’s overall 12-attachment limit.
@@ -178,7 +188,7 @@ Updates require `expectedVersion`; stale updates return 409 without modifying hi
 
 ## Verification
 
-The integration suite covers offline/key-free archived playback, range and HEAD responses, streamed download retry/recovery, startup backfill, exact generation reuse, price/time persistence, persistent keys and provider choices across restarts, provider isolation and removal, Wan payload/status/download mapping, key-free CDN requests, uncertain submission handling, key validation, upload signature checks and session isolation, model discovery, asynchronous state transitions, provider failures, retry behavior, HTTPS reference payloads, token expiry/revocation and snapshot isolation, saved prompt revisions/restoration/concurrency, cost units, and ranged video downloads. Real media fixtures verify cropping location, resizing, trimming, audio removal, EXIF/video orientation, prepared version stability, restart recovery, failed preparations, large-original upload handling, and byte-for-byte original preservation. Browser checks cover desktop/mobile editors, prompt saving and rollback, and prepared image/video/audio playback. A separate live tunnel smoke check uses a synthetic clip to verify public HTTPS range downloads and isolation from the studio API; it never calls a paid model. A paid live generation requires your own key and is not part of automated tests.
+The integration suite covers real audio-free downloads with matching video-stream hashes, original preservation, per-clip selection, cache reuse and missing-tool recovery, offline/key-free archived playback, range and HEAD responses, streamed download retry/recovery, startup backfill, exact generation reuse, price/time persistence, persistent keys and provider choices across restarts, provider isolation and removal, Wan payload/status/download mapping, key-free CDN requests, uncertain submission handling, key validation, upload signature checks and session isolation, model discovery, asynchronous state transitions, provider failures, retry behavior, HTTPS reference payloads, token expiry/revocation and snapshot isolation, saved prompt revisions/restoration/concurrency, cost units, and ranged video downloads. Real media fixtures verify cropping location, resizing, trimming, audio removal, EXIF/video orientation, prepared version stability, restart recovery, failed preparations, large-original upload handling, and byte-for-byte original preservation. Browser checks cover desktop/mobile editors, prompt saving and rollback, and prepared image/video/audio playback. A separate live tunnel smoke check uses a synthetic clip to verify public HTTPS range downloads and isolation from the studio API; it never calls a paid model. A paid live generation requires your own key and is not part of automated tests.
 
 ## API references
 
